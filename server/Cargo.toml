@@ -11,4 +11,8 @@ crate-type = ["cdylib"]
 [dependencies]
 samp = { git = "https://github.com/zottce/samp-rs.git", rev = "2e9192713bf9a77ee04e0ebbcda37d078c9c47dd", features = ["encoding"] }
 log = "0.4.29"
-server-core = { path = "../server-core" }
+crossbeam-channel = "0.5.15"
+messages = { path = "../messages" }
+quick-protobuf = "0.8.1"
+network = { path = "../network" }
+simplelog = "0.12.2"

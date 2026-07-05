@@ -10,7 +10,7 @@ pub enum State {
 
 #[derive(Debug)]
 pub struct Client {
-    id: i32,
+    id: i32, // SA:MP player id
     state: State,
     addr: SocketAddr,
     peer: PeerId,

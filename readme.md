@@ -21,8 +21,6 @@ It is **a FRAMEWORK** (or SDK), not something that you download and use. To be a
 - `proto` - raw proto files.
 - `renderer` - glue between CEF renderer process and main logic.
 - `server` - server side plugin.
-- `server-core` - shared server logic used by the SA:MP plugin and open.mp component.
-- `openmp-component` - native open.mp component built through CMake and `cxx`.
 
 ## Download
 Latest builds from the master branch are placed in [the Actions](https://github.com/ZOTTCE/samp-cef/actions).
@@ -56,16 +54,6 @@ and now
 rustup toolchain install nightly-2022-11-06-i686-pc-windows-msvc
 cargo build --release
 ```
-
-### Building the open.mp component
-Use the helper script from the repository root:
-
-```sh
-scripts/build-openmp-component.sh --openmp-root /path/to/open.mp
-scripts/build-openmp-component.sh --openmp-root /path/to/open.mp --server-root /path/to/omp-server
-```
-
-It builds `openmp-component` and installs it into `<server>/components` when `--server-root` is provided. More details are in [docs/build.md](docs/build.md) and [openmp-component/README.md](openmp-component/README.md).
 
 ### Cross-compiling the Windows client (macOS/Linux)
 Use `scripts/build-client-win32.sh` to build `client`, `renderer`, and `loader` for `i686-pc-windows-msvc` on non-Windows hosts. It relies on `cargo-xwin` (`cargo install cargo-xwin --locked`), `7z` for extracting the DirectX SDK, and downloads `libcef.lib` if `CEF_PATH` is not set. The script can also download/extract the DirectX SDK if `DX_SDK` is not set.
