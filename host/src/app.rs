@@ -128,6 +128,12 @@ impl App for HostApp {
              OptimizationHints,RendererCodeIntegrity,BackForwardCache,HardwareMediaKeyHandling,AutoDeElevate",
         );
         command_line.append_switch_with_value("js-flags", &format!("--max-old-space-size={}", js_heap_mb()));
+        // Память видеокарты под тайлы страницы: по умолчанию Chromium считает её сам, и на
+        // широких экранах (3440×1440) не хватает — «tile memory limits exceeded», тайлы карты не
+        // успевают дорисоваться. `gpu_mem_mb` в cef_host.ini, по умолчанию 1024
+        let gpu_mem = config_value("gpu_mem_mb").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1024).clamp(256, 4096);
+        command_line.append_switch_with_value("force-gpu-mem-available-mb", &gpu_mem.to_string());
+        command_line.append_switch_with_value("force-gpu-mem-discardable-limit-mb", &(gpu_mem / 2).to_string());
         // GPU-процесс в самом хосте (`gpu_process = inprocess`): меньше пересылок между процессами,
         // но падение драйвера роняет хост (игра перезапустит его через 3 с)
         if config_value("gpu_process").is_some_and(|v| v.eq_ignore_ascii_case("inprocess")) {

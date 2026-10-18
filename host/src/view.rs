@@ -73,6 +73,8 @@ pub struct View {
     /// Когда последний раз просили кадр
     #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
     last_begin_frame: Mutex<Instant>,
+    /// С какого момента игра не забирает готовый кадр
+    pending_since: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone)]
@@ -203,6 +205,7 @@ impl View {
             first_paint: AtomicBool::new(false),
             begin_frame_queued: AtomicBool::new(false),
             last_begin_frame: Mutex::new(Instant::now()),
+            pending_since: Mutex::new(None),
         })
     }
 
@@ -211,8 +214,9 @@ impl View {
     }
 
     /// Пора просить у Chromium новый кадр (pacing.rs): браузер есть и виден, запрос не стоит в
-    /// очереди, а игра забрала прошлый кадр — или давно не просили (не застрять, если игра не
-    /// забирает, например свёрнута, — тогда раз в `idle`).
+    /// очереди. Прошлый кадр игра ещё не забрала — всё равно просим: ждать её — значит идти по
+    /// очереди (запрос → кадр → чтение → игра) и терять половину кадров. Не забирает дольше
+    /// `idle` (свёрнута, загрузка) — просим не чаще раза в `idle`.
     #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
     pub fn wants_begin_frame(&self, idle: Duration) -> bool {
         if !self.external_begin_frame.load(Ordering::SeqCst)
@@ -223,7 +227,13 @@ impl View {
             return false;
         }
         let pending = self.surface.lock().as_ref().is_some_and(|s| s.pending());
-        !pending || self.last_begin_frame.lock().elapsed() >= idle
+        let mut since = self.pending_since.lock();
+        if !pending {
+            *since = None;
+            return true;
+        }
+        let stuck = since.get_or_insert_with(Instant::now).elapsed() >= idle;
+        !stuck || self.last_begin_frame.lock().elapsed() >= idle
     }
 
     /// Пометить, что запрос кадра поставлен в очередь UI-потока.
