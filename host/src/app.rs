@@ -65,6 +65,9 @@ fn js_heap_mb() -> u32 {
     config_value("js_heap_mb").and_then(|v| v.parse().ok()).unwrap_or(384)
 }
 
+/// CEF дошёл до готовности (main.rs: пока нет — раз в 2 с лог с дочерними процессами)
+pub static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Clone)]
 struct HostApp {
     writer: Arc<Writer>,
@@ -74,8 +77,14 @@ struct HostApp {
 impl RenderProcessHandler for HostApp {}
 
 impl BrowserProcessHandler for HostApp {
+    #[cfg(feature = "modern")]
+    fn on_before_child_process_launch(&self, process_type: String) {
+        log::info!("CEF запускает процесс: {}", if process_type.is_empty() { "?" } else { &process_type });
+    }
+
     fn on_context_initialized(&self) {
-        log::info!("CEF готов (on_context_initialized) — Ready игре");
+        log::info!("CEF готов (on_context_initialized) — Ready игре; дочерние процессы: {}", ipc::priority::children_text());
+        READY.store(true, std::sync::atomic::Ordering::SeqCst);
         crate::assets_scheme::register_scheme_handler_factory();
         self.writer.send(&ToGame::Ready);
     }
@@ -145,7 +154,15 @@ pub fn initialize(writer: Arc<Writer>, render: RenderMode) {
     settings.browser_subprocess_path = subprocess;
     settings.windowless_rendering_enabled = 1;
     settings.multi_threaded_message_loop = 1;
-    settings.log_severity = cef_sys::cef_log_severity_t::LOGSEVERITY_ERROR;
+    // cef.log: `cef_log = info | warning | error` в cef_host.ini (на CEF 150 пока info — ищем,
+    // почему из игры он не доходит до готовности)
+    settings.log_severity = match config_value("cef_log").map(|v| v.to_ascii_lowercase()).as_deref() {
+        Some("info") => cef_sys::cef_log_severity_t::LOGSEVERITY_INFO,
+        Some("warning") => cef_sys::cef_log_severity_t::LOGSEVERITY_WARNING,
+        Some("error") => cef_sys::cef_log_severity_t::LOGSEVERITY_ERROR,
+        _ if cfg!(feature = "modern") => cef_sys::cef_log_severity_t::LOGSEVERITY_INFO,
+        _ => cef_sys::cef_log_severity_t::LOGSEVERITY_ERROR,
+    };
     settings.locales_dir_path = locales;
     settings.resources_dir_path = resources;
     settings.log_file = log_file;
@@ -165,5 +182,7 @@ pub fn initialize(writer: Arc<Writer>, render: RenderMode) {
         settings.user_data_path = cef::types::string::into_cef_string(&dir.join("user_data").to_string_lossy());
     }
 
-    cef::initialize(Some(&main_args), &settings, Some(HostApp { writer, render }));
+    log::info!("cef::initialize: папка {}, процессы страниц {}", dir.display(), dir.join("renderer.exe").display());
+    let result = cef::initialize(Some(&main_args), &settings, Some(HostApp { writer, render }));
+    log::info!("cef::initialize вернул {}", result);
 }

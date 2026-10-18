@@ -270,10 +270,20 @@ fn main() {
         ShowWindow(GetConsoleWindow(), 0);
     }
 
+    // Каждый запуск — строка в renderer.log рядом с exe (тип процесса, pid, ключи): видно, какие
+    // процессы Chromium вообще стартовали
+    renderer_log();
+
     // GPU-процесс Chromium рисует интерфейс на видеокарте — пусть получает её раньше игры без
     // ограничения FPS (ipc::priority). Процессам страниц приоритет не трогаем.
     if std::env::args().any(|arg| arg == "--type=gpu-process") {
-        ipc::priority::raise_current(false);
+        let result = ipc::priority::raise_current(false);
+        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("renderer.log")) {
+                let _ = writeln!(file, "  gpu-process pid {}: приоритет {}", std::process::id(), result);
+            }
+        }
     }
 
     let instance = unsafe { GetModuleHandleA(std::ptr::null()) };
@@ -372,5 +382,37 @@ fn convert_to_v8(pm: &List, offset: usize, v8: &mut Vec<V8Value>) {
 
             _ => v8.push(V8Value::new_undefined()),
         }
+    }
+}
+
+fn renderer_log() {
+    use std::io::Write;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let kind = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--type="))
+        .unwrap_or("?")
+        .to_string();
+    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut line = format!(
+        "{:02}:{:02}:{:02} pid {} тип {} :: {}",
+        secs / 3600 % 24,
+        secs / 60 % 60,
+        secs % 60,
+        std::process::id(),
+        kind,
+        args.join(" ")
+    );
+    if line.len() > 1500 {
+        line.truncate(line.char_indices().nth(1500).map(|(i, _)| i).unwrap_or(line.len()));
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("renderer.log")) {
+        let _ = writeln!(file, "{}", line);
     }
 }

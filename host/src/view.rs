@@ -68,6 +68,8 @@ pub struct View {
     /// Запрос кадра стоит в очереди UI-потока CEF — новый не ставим
     #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
     begin_frame_queued: AtomicBool,
+    /// Первый кадр (обычный / текстурой) — в лог один раз
+    first_paint: AtomicBool,
     /// Когда последний раз просили кадр
     #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
     last_begin_frame: Mutex<Instant>,
@@ -198,6 +200,7 @@ impl View {
             paints: Mutex::new(ipc::stats::Stats::default()),
             readback: Mutex::new(None),
             external_begin_frame: AtomicBool::new(false),
+            first_paint: AtomicBool::new(false),
             begin_frame_queued: AtomicBool::new(false),
             last_begin_frame: Mutex::new(Instant::now()),
         })
@@ -454,7 +457,12 @@ impl View {
 impl LifespanHandler for ViewRef {
     fn on_after_created(&self, browser: Browser) {
         *self.0.browser.lock() = Some(browser);
-        log::info!("browser {} created", self.0.id);
+        log::info!(
+            "browser {} created (кадры {}, частота {})",
+            self.0.id,
+            if self.0.external_begin_frame.load(Ordering::SeqCst) { "по запросу хоста" } else { "по таймеру Chromium" },
+            self.0.frame_rate.load(Ordering::SeqCst)
+        );
 
         let view = &self.0;
         view.set_frame_rate(view.frame_rate.load(Ordering::SeqCst));
@@ -515,6 +523,9 @@ impl RenderHandler for ViewRef {
 
         match paint_type {
             PaintElement::View => {
+                if !self.0.first_paint.swap(true, Ordering::SeqCst) {
+                    log::info!("браузер {}: первый кадр (обычный, в память) {}x{}, общая память {}x{}", self.0.id, width, height, w, h);
+                }
                 if width as i32 != w || height as i32 != h || buffer.len() < width * height * 4 {
                     return;
                 }
@@ -555,8 +566,12 @@ impl ViewRef {
     fn accelerated_paint(&self, paint_type: PaintElement, dirty_rects: DirtyRects, handle: *mut std::ffi::c_void) {
         #[cfg(feature = "modern")]
         crate::pacing::PAINTS.fetch_add(1, Ordering::Relaxed);
+        if !self.0.first_paint.swap(true, Ordering::SeqCst) {
+            log::info!("браузер {}: первый кадр текстурой видеокарты, дескриптор {:?}", self.0.id, handle);
+        }
         let readback = self.0.readback.lock();
         let Some(readback) = readback.as_ref() else {
+            log::error!("браузер {}: кадр текстурой, а чтение текстур не включено", self.0.id);
             return;
         };
         match paint_type {
@@ -585,6 +600,10 @@ impl ViewRef {
 }
 
 impl LoadHandler for ViewRef {
+    fn on_loading_state_change(&self, _browser: Browser, is_loading: bool, _back: bool, _forward: bool) {
+        log::info!("browser {}: {}", self.0.id, if is_loading { "загрузка страницы…" } else { "страница загружена" });
+    }
+
     fn on_load_end(&self, _browser: Browser, frame: Frame, status_code: i32) {
         log::info!("browser {} load end: {}", self.0.id, status_code);
         if frame.is_main() {

@@ -8,7 +8,7 @@ use crossbeam_channel::Sender;
 
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess};
-use winapi::um::winbase::{CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT};
+use winapi::um::winbase::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT};
 
 use ipc::channel::{Handle, Writer, create_pipe};
 use ipc::{ToGame, ToHost};
@@ -24,6 +24,15 @@ impl HostProcess {
     /// false — хост завершился (канал закрыт).
     pub fn send(&self, message: &ToHost) -> bool {
         self.writer.send(message)
+    }
+
+    /// Код завершения хоста (259 — ещё работает).
+    pub fn exit_code(&self) -> u32 {
+        let mut code = 0;
+        unsafe {
+            winapi::um::processthreadsapi::GetExitCodeProcess(self.process.raw(), &mut code);
+        }
+        code
     }
 
     /// Завис при запуске (переход на совместимый хост): закрыть канал мало — CEF может не
@@ -81,20 +90,38 @@ pub fn spawn(event_tx: Sender<Event>, dir: &std::path::Path, generation: u32) ->
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    let ok = unsafe {
+    // Игра может работать в объекте задания (Job) — его наследуют дочерние процессы, и Chromium
+    // 150 из него не запускает свои служебные процессы (сеть, GPU). Пробуем вывести хост из Job;
+    // Job этого не разрешает — запускаем как раньше.
+    log::info!(
+        "запуск хоста: {} (папка {}), игра: {}, __COMPAT_LAYER игры: {}",
+        exe.display(),
+        String::from_utf16_lossy(&dir[..dir.len().saturating_sub(1)]),
+        ipc::priority::job_status(),
+        std::env::var("__COMPAT_LAYER").unwrap_or_else(|_| "нет".into())
+    );
+    let mut launch = |flags: u32| unsafe {
         CreateProcessW(
             exe_wide.as_ptr(),
             command.as_mut_ptr(),
             null_mut(),
             null_mut(),
             TRUE,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            flags,
             environment.as_mut_ptr() as *mut _,
             dir.as_ptr(),
             &mut startup,
             &mut info,
         )
     };
+    let base = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    let mut ok = launch(base | CREATE_BREAKAWAY_FROM_JOB);
+    if ok == FALSE {
+        log::info!("хост без выхода из Job ({})", std::io::Error::last_os_error());
+        ok = launch(base);
+    } else {
+        log::info!("хост запущен с выходом из Job");
+    }
     if ok == FALSE {
         log::error!(
             "не запустился {}: ошибка Windows {}",
@@ -110,7 +137,7 @@ pub fn spawn(event_tx: Sender<Event>, dir: &std::path::Path, generation: u32) ->
     drop(child_in);
     drop(child_out);
 
-    log::trace!("cef_host.exe запущен, pid {}", info.dwProcessId);
+    log::info!("cef_host.exe запущен, pid {}", info.dwProcessId);
 
     std::thread::spawn(move || {
         ipc::channel::read_loop::<ToGame>(&from_host, |message| {

@@ -72,6 +72,7 @@ impl Device {
     pub fn create() -> Option<Arc<Device>> {
         let mut device = null_mut();
         let mut context = null_mut();
+        let mut level = 0;
         let hr = unsafe {
             D3D11CreateDevice(
                 null_mut(),
@@ -82,7 +83,7 @@ impl Device {
                 0,
                 D3D11_SDK_VERSION,
                 &mut device,
-                null_mut(),
+                &mut level,
                 &mut context,
             )
         };
@@ -90,6 +91,7 @@ impl Device {
             log::error!("D3D11CreateDevice: 0x{:08X}", hr as u32);
             return None;
         }
+        log::info!("D3D11 для общей текстуры: уровень 0x{:X}", level);
         let device = Com(device);
         let context = Com(context);
 

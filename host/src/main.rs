@@ -70,6 +70,15 @@ impl Host {
     }
 
     fn handle(&self, message: ToHost) {
+        // Всё, кроме движения мыши (его слишком много), — в лог
+        if !matches!(message, ToHost::MouseMove { .. }) {
+            let mut text = format!("{:?}", message);
+            if text.len() > 300 {
+                text.truncate(text.char_indices().nth(300).map(|(i, _)| i).unwrap_or(text.len()));
+                text.push_str("…");
+            }
+            log::info!("игра → хост: {}", text);
+        }
         match message {
             ToHost::CreateBrowser {
                 id,
@@ -239,6 +248,7 @@ fn main() {
     log::info!("{}", ENGINE);
     // Интерфейс получает видеокарту раньше игры без ограничения FPS (ipc::priority)
     log::info!("приоритет хоста: {}", ipc::priority::raise_current(true));
+    log::info!("{}", ipc::priority::job_status());
 
     let (Some(input), Some(output)) = (
         arg("--in").and_then(|a| Handle::from_arg(&a)),
@@ -272,8 +282,27 @@ fn main() {
     if external_begin_frame(host.gpu.is_some()) {
         pacing::start(host.views.clone(), host.frame_rate.clone());
     }
+    let started = std::time::Instant::now();
     app::initialize(writer, render);
     log::info!("CEF запущен, ждём команды игры");
+
+    // Пока CEF не готов — раз в 2 с: сколько ждём и какие дочерние процессы Chromium живы;
+    // после готовности — ещё раз через 5 с (видно GPU-процесс и процессы страниц)
+    std::thread::spawn(move || {
+        while !app::READY.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if app::READY.load(Ordering::SeqCst) {
+                break;
+            }
+            log::warn!(
+                "CEF ещё не готов: {:.0} с; дочерние процессы: {}",
+                started.elapsed().as_secs_f64(),
+                ipc::priority::children_text()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        log::info!("через 5 с после готовности дочерние процессы: {}", ipc::priority::children_text());
+    });
 
     ipc::channel::read_loop::<ToHost>(&input, |message| host.handle(message));
 

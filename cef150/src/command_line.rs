@@ -34,6 +34,19 @@ impl CommandLine {
         }
     }
 
+    /// Значение ключа (`--type=gpu-process` → "gpu-process"); нет ключа — пусто.
+    pub fn switch_value(&self, name: &str) -> String {
+        let name = CefString::new(name);
+        let Some(func) = self.inner.get_switch_value else {
+            return String::new();
+        };
+        let raw = unsafe { func(self.inner.get_mut(), name.as_cef_string()) };
+        if raw.is_null() {
+            return String::new();
+        }
+        CefString::from(raw).to_string()
+    }
+
     pub fn append_switch(&self, switch: &str) {
         let switch = CefString::new(switch);
         let func = self.inner.append_switch.unwrap();

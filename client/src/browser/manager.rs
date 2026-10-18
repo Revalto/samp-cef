@@ -130,6 +130,9 @@ impl Manager {
 
     /// Современный хост не работает: запомнить (engine.rs) и сразу запустить совместимый.
     fn fall_back(&mut self, reason: &str) {
+        if let Some(host) = self.host.as_ref() {
+            log::error!("откат: хост ещё {} (код 0x{:X})", if host.exit_code() == 259 { "работает" } else { "завершён" }, host.exit_code());
+        }
         engine::disable_modern(reason);
         if let Some(host) = self.host.take() {
             host.kill();
@@ -178,6 +181,9 @@ impl Manager {
     pub fn on_host_lost(&mut self, generation: u32) {
         if generation != self.host_generation {
             return; // прежний хост, его уже заменили
+        }
+        if let Some(host) = self.host.as_ref() {
+            log::error!("хост завершился, код 0x{:X} ({})", host.exit_code(), self.engine.name());
         }
         if self.engine == Engine::Modern && self.cef_running {
             let now = Instant::now();

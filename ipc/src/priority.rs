@@ -11,6 +11,20 @@ use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 use winapi::um::processthreadsapi::{GetCurrentProcess, SetPriorityClass};
 use winapi::um::winbase::ABOVE_NORMAL_PRIORITY_CLASS;
 
+/// В объекте задания (Job) ли процесс — для логов: из Job без права выхода дочерние процессы
+/// Chromium (сеть, GPU) могут не запуститься.
+pub fn job_status() -> String {
+    let mut in_job = 0;
+    let ok = unsafe { winapi::um::jobapi::IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) };
+    if ok == 0 {
+        "Job: не удалось узнать".into()
+    } else if in_job != 0 {
+        "процесс в объекте задания (Job)".into()
+    } else {
+        "процесс не в объекте задания (Job)".into()
+    }
+}
+
 /// D3DKMT_SCHEDULINGPRIORITYCLASS
 const PRIORITY_ABOVE_NORMAL: i32 = 3;
 const PRIORITY_HIGH: i32 = 4;
@@ -54,4 +68,29 @@ pub fn raise_current(cpu: bool) -> String {
         }
     }
     result
+}
+
+/// Дочерние процессы текущего (для логов): «renderer.exe 1234, renderer.exe 5678».
+pub fn children_text() -> String {
+    use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    let me = std::process::id();
+    let mut list = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            return "снимок процессов не получен".into();
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snapshot, &mut entry);
+        while ok != 0 {
+            if entry.th32ParentProcessID == me {
+                let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                list.push(format!("{} {}", String::from_utf16_lossy(&entry.szExeFile[..len]), entry.th32ProcessID));
+            }
+            ok = Process32NextW(snapshot, &mut entry);
+        }
+        winapi::um::handleapi::CloseHandle(snapshot);
+    }
+    if list.is_empty() { "нет".into() } else { list.join(", ") }
 }
