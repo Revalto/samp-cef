@@ -71,7 +71,7 @@ impl Host {
 
     fn handle(&self, message: ToHost) {
         // Всё, кроме движения мыши (его слишком много), — в лог
-        if !matches!(message, ToHost::MouseMove { .. }) {
+        if !matches!(message, ToHost::MouseMove { .. } | ToHost::FrameRate(_)) {
             let mut text = format!("{:?}", message);
             if text.len() > 300 {
                 text.truncate(text.char_indices().nth(300).map(|(i, _)| i).unwrap_or(text.len()));

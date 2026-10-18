@@ -372,6 +372,11 @@ impl View {
             return;
         };
         let mut cef_event: cef_key_event_t = unsafe { std::mem::zeroed() };
+        // CEF 150: без size событие отбрасывается — клавиатура в поля ввода не доходит
+        #[cfg(feature = "modern")]
+        {
+            cef_event.size = std::mem::size_of::<cef_key_event_t>();
+        }
         cef_event.type_ = match event.kind {
             KeyEventKind::RawKeyDown => cef_key_event_type_t::KEYEVENT_RAWKEYDOWN,
             KeyEventKind::KeyUp => cef_key_event_type_t::KEYEVENT_KEYUP,
@@ -381,6 +386,11 @@ impl View {
         cef_event.windows_key_code = event.windows_key_code;
         cef_event.native_key_code = event.native_key_code;
         cef_event.is_system_key = event.is_system_key as i32;
+        if let KeyEventKind::Char = event.kind {
+            // Для Char в windows_key_code — сам символ (WM_CHAR)
+            cef_event.character = event.windows_key_code as u16;
+            cef_event.unmodified_character = event.windows_key_code as u16;
+        }
         host.send_keyboard_event(cef_event);
     }
 
