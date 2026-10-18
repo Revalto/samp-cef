@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -19,6 +19,11 @@ const MIN_FPS: i32 = 30;
 const DEFAULT_MAX_FPS: i32 = 144;
 /// Игра не забирает кадры (свёрнута, загрузка) — всё равно просить, но не чаще
 const IDLE: Duration = Duration::from_millis(100);
+
+/// Для лога раз в 5 с: сколько запросов кадра поставлено в UI-поток CEF и сколько выполнено
+pub static POSTED: AtomicU32 = AtomicU32::new(0);
+pub static EXECUTED: AtomicU32 = AtomicU32::new(0);
+pub static PAINTS: AtomicU32 = AtomicU32::new(0);
 
 pub fn start(views: Arc<Mutex<HashMap<u32, Arc<View>>>>, game_fps: Arc<AtomicI32>) {
     let max = crate::app::config_value("max_fps")
@@ -33,7 +38,19 @@ pub fn start(views: Arc<Mutex<HashMap<u32, Arc<View>>>>, game_fps: Arc<AtomicI32
             winapi::um::timeapi::timeBeginPeriod(1);
         }
         let mut next = Instant::now();
+        let mut report = Instant::now();
         loop {
+            if report.elapsed() >= Duration::from_secs(5) {
+                let secs = report.elapsed().as_secs_f64();
+                log::info!(
+                    "запросы кадров: поставлено {:.1}/с, выполнено {:.1}/с, кадров от Chromium {:.1}/с (частота игры {})",
+                    POSTED.swap(0, Ordering::Relaxed) as f64 / secs,
+                    EXECUTED.swap(0, Ordering::Relaxed) as f64 / secs,
+                    PAINTS.swap(0, Ordering::Relaxed) as f64 / secs,
+                    game_fps.load(Ordering::SeqCst)
+                );
+                report = Instant::now();
+            }
             let fps = game_fps.load(Ordering::SeqCst).clamp(MIN_FPS, max);
             next += Duration::from_secs_f64(1.0 / fps as f64);
             let now = Instant::now();
@@ -49,7 +66,9 @@ pub fn start(views: Arc<Mutex<HashMap<u32, Arc<View>>>>, game_fps: Arc<AtomicI32
                     continue;
                 }
                 let target = view.clone();
-                if !cef::task::post_ui_task(move || target.begin_frame()) {
+                if cef::task::post_ui_task(move || target.begin_frame()) {
+                    POSTED.fetch_add(1, Ordering::Relaxed);
+                } else {
                     view.cancel_begin_frame(); // CEF ещё не запущен
                 }
             }

@@ -241,7 +241,10 @@ impl View {
         *self.last_begin_frame.lock() = Instant::now();
         if let Some(host) = self.browser().map(|b| b.host()) {
             #[cfg(feature = "modern")]
-            host.send_external_begin_frame();
+            {
+                host.send_external_begin_frame();
+                crate::pacing::EXECUTED.fetch_add(1, Ordering::Relaxed);
+            }
             #[cfg(not(feature = "modern"))]
             let _ = host;
         }
@@ -550,6 +553,8 @@ impl RenderHandler for ViewRef {
 
 impl ViewRef {
     fn accelerated_paint(&self, paint_type: PaintElement, dirty_rects: DirtyRects, handle: *mut std::ffi::c_void) {
+        #[cfg(feature = "modern")]
+        crate::pacing::PAINTS.fetch_add(1, Ordering::Relaxed);
         let readback = self.0.readback.lock();
         let Some(readback) = readback.as_ref() else {
             return;

@@ -8,7 +8,7 @@ use crossbeam_channel::Sender;
 
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess};
-use winapi::um::winbase::CREATE_NO_WINDOW;
+use winapi::um::winbase::{CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT};
 
 use ipc::channel::{Handle, Writer, create_pipe};
 use ipc::{ToGame, ToHost};
@@ -35,6 +35,27 @@ impl HostProcess {
     }
 }
 
+/// Окружение игры для хоста — без `__COMPAT_LAYER`: через неё режим совместимости gta_sa.exe
+/// (Windows ставит ей, например, DWM8And16BitMitigation) переходит на дочерние процессы, и под
+/// этой прослойкой CEF 150 не доходит до готовности. Блок UTF-16: `ИМЯ=значение\0...\0\0`.
+fn host_environment() -> Vec<u16> {
+    let mut block = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        if name.to_string_lossy().eq_ignore_ascii_case("__COMPAT_LAYER") {
+            continue;
+        }
+        block.extend(name.encode_wide());
+        block.push('=' as u16);
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 /// Запускает cef_host.exe из `dir` (engine.rs: cef-modern\ или cef\). Сообщения хоста приходят в
 /// `event_tx` как `Event::Host`, обрыв связи — `Event::HostLost`; `generation` — номер запуска:
 /// события от прежнего (убитого) хоста менеджер отбрасывает.
@@ -55,6 +76,7 @@ pub fn spawn(event_tx: Sender<Event>, dir: &std::path::Path, generation: u32) ->
     let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let dir: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
 
+    let mut environment = host_environment();
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -66,8 +88,8 @@ pub fn spawn(event_tx: Sender<Event>, dir: &std::path::Path, generation: u32) ->
             null_mut(),
             null_mut(),
             TRUE,
-            CREATE_NO_WINDOW,
-            null_mut(),
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_mut_ptr() as *mut _,
             dir.as_ptr(),
             &mut startup,
             &mut info,

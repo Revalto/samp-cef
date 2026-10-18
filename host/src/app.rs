@@ -75,7 +75,7 @@ impl RenderProcessHandler for HostApp {}
 
 impl BrowserProcessHandler for HostApp {
     fn on_context_initialized(&self) {
-        log::trace!("on_context_initialized");
+        log::info!("CEF готов (on_context_initialized) — Ready игре");
         crate::assets_scheme::register_scheme_handler_factory();
         self.writer.send(&ToGame::Ready);
     }
