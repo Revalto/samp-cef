@@ -177,6 +177,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cef-sys150"
+version = "0.1.0"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
+name = "cef150"
+version = "0.1.0"
+dependencies = [
+ "cef-sys150",
+ "testdrop",
+ "widestring",
+]
+
+[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,6 +510,8 @@ version = "0.1.0"
 dependencies = [
  "cef",
  "cef-sys",
+ "cef-sys150",
+ "cef150",
  "ipc",
  "log",
  "parking_lot",
@@ -1160,6 +1178,9 @@ version = "0.1.0"
 dependencies = [
  "cef",
  "cef-sys",
+ "cef-sys150",
+ "cef150",
+ "ipc",
  "winapi",
 ]
 

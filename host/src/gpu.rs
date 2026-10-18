@@ -61,6 +61,9 @@ impl<T: Interface> Drop for Com<T> {
 /// Своё устройство D3D11 на весь хост. Немедленный контекст однопоточный — под замком.
 pub struct Device {
     device: Com<ID3D11Device>,
+    /// CEF 150 отдаёт NT-дескриптор — открывает его только ID3D11Device1::OpenSharedResource1
+    #[cfg(feature = "modern")]
+    device1: Option<Com<winapi::um::d3d11_1::ID3D11Device1>>,
     context: Mutex<Com<ID3D11DeviceContext>>,
     query: Com<ID3D11Query>,
 }
@@ -101,8 +104,24 @@ impl Device {
             return None;
         }
 
+        #[cfg(feature = "modern")]
+        let device1 = {
+            let mut device1: *mut winapi::ctypes::c_void = null_mut();
+            let hr = unsafe {
+                (*(device.ptr() as *mut IUnknown))
+                    .QueryInterface(&winapi::um::d3d11_1::ID3D11Device1::uuidof(), &mut device1)
+            };
+            if !SUCCEEDED(hr) || device1.is_null() {
+                log::error!("ID3D11Device1 нет (0x{:08X}) — общая текстура CEF 150 не откроется", hr as u32);
+                return None;
+            }
+            Some(Com(device1 as *mut winapi::um::d3d11_1::ID3D11Device1))
+        };
+
         Some(Arc::new(Device {
             device,
+            #[cfg(feature = "modern")]
+            device1,
             context: Mutex::new(context),
             query: Com(query),
         }))
@@ -110,6 +129,14 @@ impl Device {
 
     fn open(&self, handle: *mut c_void) -> Option<Com<ID3D11Texture2D>> {
         let mut texture: *mut winapi::ctypes::c_void = null_mut();
+        #[cfg(feature = "modern")]
+        let hr = match self.device1.as_ref() {
+            Some(device1) => unsafe {
+                (*device1.ptr()).OpenSharedResource1(handle as _, &ID3D11Texture2D::uuidof(), &mut texture)
+            },
+            None => return None,
+        };
+        #[cfg(not(feature = "modern"))]
         let hr = unsafe {
             (*self.device.ptr()).OpenSharedResource(handle as _, &ID3D11Texture2D::uuidof(), &mut texture)
         };
@@ -284,6 +311,11 @@ impl Readback {
         let mut state = lock.lock();
 
         let key = handle as usize;
+        // CEF 150: NT-дескриптор живёт только внутри вызова, его номер потом достаётся другой
+        // текстуре — по номеру не кэшируем, открываем каждый кадр (это десятки микросекунд)
+        if cfg!(feature = "modern") {
+            state.opened.remove(&key);
+        }
         if !state.opened.contains_key(&key) {
             let Some(texture) = self.device.open(handle) else {
                 return;

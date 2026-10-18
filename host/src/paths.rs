@@ -8,7 +8,12 @@ pub fn cef_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Локальные файлы интерфейса — схема sampcef://assets/ (assets_scheme.rs).
+/// Локальные файлы интерфейса — схема sampcef://assets/ (assets_scheme.rs). У обоих хостов
+/// (cef\ и cef-modern\) они одни — в cef\assets игры.
 pub fn assets_dir() -> PathBuf {
-    cef_dir().join("assets")
+    let dir = cef_dir();
+    match dir.parent() {
+        Some(game) => game.join("cef").join("assets"),
+        None => dir.join("assets"),
+    }
 }

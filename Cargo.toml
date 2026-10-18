@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "cef-sys",
     "cef",
+    "cef-sys150",
+    "cef150",
     "loader",
     "client",
     "renderer",

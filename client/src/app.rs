@@ -66,10 +66,10 @@ pub enum Event {
     AlwaysListenKeys(u32, bool),
     Terminate,
 
-    /// Сообщение от cef_host.exe
-    Host(ToGame),
+    /// Сообщение от cef_host.exe (номер запуска хоста, см. browser/host.rs)
+    Host(u32, ToGame),
     /// cef_host.exe завершился
-    HostLost,
+    HostLost(u32),
 }
 
 #[derive(Debug)]
@@ -501,9 +501,13 @@ pub fn mainloop() {
                     crate::external::browser_created(id, code);
                 }
 
-                Event::Host(message) => app.handle_host(message),
+                Event::Host(generation, message) => {
+                    if app.manager.lock().is_current_host(generation) {
+                        app.handle_host(message);
+                    }
+                }
 
-                Event::HostLost => app.manager.lock().on_host_lost(),
+                Event::HostLost(generation) => app.manager.lock().on_host_lost(generation),
 
                 Event::CefInitialize => {
                     log::trace!("Initialized. Elapsed: {:?}", app.initialization.elapsed());

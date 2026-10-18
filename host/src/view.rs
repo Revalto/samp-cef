@@ -63,6 +63,14 @@ pub struct View {
     paints: Mutex<ipc::stats::Stats>,
     /// render = shared: кадры текстурой на видеокарте (gpu.rs)
     readback: Mutex<Option<Readback>>,
+    /// Кадры по запросу хоста (pacing.rs): включено при создании браузера
+    external_begin_frame: AtomicBool,
+    /// Запрос кадра стоит в очереди UI-потока CEF — новый не ставим
+    #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
+    begin_frame_queued: AtomicBool,
+    /// Когда последний раз просили кадр
+    #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
+    last_begin_frame: Mutex<Instant>,
 }
 
 #[derive(Clone)]
@@ -189,7 +197,55 @@ impl View {
             clicks: Mutex::new(Clicks::default()),
             paints: Mutex::new(ipc::stats::Stats::default()),
             readback: Mutex::new(None),
+            external_begin_frame: AtomicBool::new(false),
+            begin_frame_queued: AtomicBool::new(false),
+            last_begin_frame: Mutex::new(Instant::now()),
         })
+    }
+
+    pub fn set_external_begin_frame(&self, enabled: bool) {
+        self.external_begin_frame.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Пора просить у Chromium новый кадр (pacing.rs): браузер есть и виден, запрос не стоит в
+    /// очереди, а игра забрала прошлый кадр — или давно не просили (не застрять, если игра не
+    /// забирает, например свёрнута, — тогда раз в `idle`).
+    #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
+    pub fn wants_begin_frame(&self, idle: Duration) -> bool {
+        if !self.external_begin_frame.load(Ordering::SeqCst)
+            || self.hidden.load(Ordering::SeqCst)
+            || self.begin_frame_queued.load(Ordering::SeqCst)
+            || self.browser.lock().is_none()
+        {
+            return false;
+        }
+        let pending = self.surface.lock().as_ref().is_some_and(|s| s.pending());
+        !pending || self.last_begin_frame.lock().elapsed() >= idle
+    }
+
+    /// Пометить, что запрос кадра поставлен в очередь UI-потока.
+    #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
+    pub fn queue_begin_frame(&self) -> bool {
+        !self.begin_frame_queued.swap(true, Ordering::SeqCst)
+    }
+
+    /// Запрос в очередь не встал.
+    #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
+    pub fn cancel_begin_frame(&self) {
+        self.begin_frame_queued.store(false, Ordering::SeqCst);
+    }
+
+    /// В UI-потоке CEF: запросить кадр.
+    #[cfg_attr(not(feature = "modern"), allow(dead_code))] // внешний BeginFrame — только CEF 150
+    pub fn begin_frame(&self) {
+        *self.last_begin_frame.lock() = Instant::now();
+        if let Some(host) = self.browser().map(|b| b.host()) {
+            #[cfg(feature = "modern")]
+            host.send_external_begin_frame();
+            #[cfg(not(feature = "modern"))]
+            let _ = host;
+        }
+        self.begin_frame_queued.store(false, Ordering::SeqCst);
     }
 
     /// Кадры текстурой на видеокарте (render = shared). До создания браузера.
@@ -354,10 +410,24 @@ impl View {
         let window_name = CefString::new(&caption);
         let mut window_info = unsafe { std::mem::zeroed::<cef_sys::cef_window_info_t>() };
         window_info.style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VISIBLE;
-        window_info.x = CW_USEDEFAULT;
-        window_info.y = CW_USEDEFAULT;
-        window_info.width = CW_USEDEFAULT;
-        window_info.height = CW_USEDEFAULT;
+        // CEF 150: положение окна — в bounds, у структуры есть поле size
+        #[cfg(feature = "modern")]
+        {
+            window_info.size = std::mem::size_of::<cef_sys::cef_window_info_t>();
+            window_info.bounds = cef_sys::cef_rect_t {
+                x: CW_USEDEFAULT,
+                y: CW_USEDEFAULT,
+                width: CW_USEDEFAULT,
+                height: CW_USEDEFAULT,
+            };
+        }
+        #[cfg(not(feature = "modern"))]
+        {
+            window_info.x = CW_USEDEFAULT;
+            window_info.y = CW_USEDEFAULT;
+            window_info.width = CW_USEDEFAULT;
+            window_info.height = CW_USEDEFAULT;
+        }
         window_info.window_name = window_name.to_cef_string();
         window_info.windowless_rendering_enabled = 0;
 
@@ -529,6 +599,9 @@ impl ContextMenuHandler for ViewRef {
 
 impl AudioHandler for ViewRef {}
 
+#[cfg(feature = "modern")]
+impl cef::handlers::permission::PermissionHandler for ViewRef {}
+
 fn flag_arg(list: &List) -> bool {
     match list.get_type(0) {
         ValueType::Integer => list.integer(0) == 1,
@@ -543,6 +616,8 @@ impl Client for ViewRef {
     type ContextMenuHandler = Self;
     type LoadHandler = Self;
     type AudioHandler = Self;
+    #[cfg(feature = "modern")]
+    type PermissionHandler = Self;
 
     fn lifespan_handler(&self) -> Option<Self> {
         Some(self.clone())

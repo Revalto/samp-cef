@@ -11,11 +11,22 @@ rust-version = "1.93"
 name = "cef_host"
 path = "src/main.rs"
 
+# Две сборки из одного кода (CEF подключается как `cef` / `cef_sys`, см. main.rs):
+#   legacy (по умолчанию) — CEF 89, папка игры cef\ — совместимый режим (Windows 7/8.1, откат);
+#   modern — CEF 150, папка cef-modern\ — кадр текстурой видеокарты и внешний BeginFrame.
+#            Собирать с --no-default-features --features modern (см. scripts/build-client-win32.sh).
+[features]
+default = ["legacy"]
+legacy = ["dep:cef89", "dep:cef_sys89"]
+modern = ["dep:cef150", "dep:cef_sys150"]
+
 [dependencies]
-cef = { path = "../cef" }
-cef-sys = { path = "../cef-sys" }
+cef89 = { package = "cef", path = "../cef", optional = true }
+cef_sys89 = { package = "cef-sys", path = "../cef-sys", optional = true }
+cef150 = { package = "cef150", path = "../cef150", optional = true }
+cef_sys150 = { package = "cef-sys150", path = "../cef-sys150", optional = true }
 ipc = { path = "../ipc" }
-winapi = { version = "0.3.9", features = ["libloaderapi", "winuser", "processthreadsapi", "synchapi", "winbase", "handleapi", "d3d11", "d3dcommon", "dxgi", "dxgiformat", "dxgitype", "winerror", "unknwnbase"] }
+winapi = { version = "0.3.9", features = ["libloaderapi", "winuser", "processthreadsapi", "synchapi", "winbase", "handleapi", "d3d11", "d3d11_1", "d3dcommon", "dxgi", "dxgiformat", "dxgitype", "winerror", "unknwnbase", "timeapi"] }
 log = "0.4.29"
 simplelog = "0.12.2"
 parking_lot = "0.12.5"

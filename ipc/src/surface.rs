@@ -160,6 +160,13 @@ impl Surface {
         SurfaceGuard { surface: self }
     }
 
+    /// Хост: игра ещё не забрала прошлый кадр (рукопожатие «кадр готов → кадр забран»: пока
+    /// забрать не успела, новый кадр у Chromium не просим — лишняя работа и рывки).
+    pub fn pending(&self) -> bool {
+        let header = self.view as *const Header;
+        unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*header).dirty)) != 0 }
+    }
+
     /// Игра: занято — не ждём, заберём в следующем кадре.
     pub fn try_lock(&self) -> Option<SurfaceGuard<'_>> {
         self.header()

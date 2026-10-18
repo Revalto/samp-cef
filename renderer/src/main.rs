@@ -1,5 +1,15 @@
 #![windows_subsystem = "windows"]
 
+// Одна из двух версий CEF под общими именами `cef` / `cef_sys` (Cargo.toml: legacy / modern)
+#[cfg(feature = "modern")]
+extern crate cef150 as cef;
+#[cfg(feature = "modern")]
+extern crate cef_sys150 as cef_sys;
+#[cfg(not(feature = "modern"))]
+extern crate cef89 as cef;
+#[cfg(not(feature = "modern"))]
+extern crate cef_sys89 as cef_sys;
+
 use winapi::um::libloaderapi::GetModuleHandleA;
 use winapi::um::wincon::GetConsoleWindow;
 use winapi::um::winuser::{MessageBoxA, ShowWindow};
@@ -156,8 +166,10 @@ impl App for Application {
     }
 
     fn on_register_custom_schemes(&self, registrar: *mut cef_sys::cef_scheme_registrar_t) {
+        // В CEF 150 функция unsafe (registrar — тот, что передал CEF), в CEF 89 — обычная
+        #[allow(unused_unsafe)]
         let result =
-            cef::scheme::register_custom_scheme(registrar, ASSET_SCHEME, ASSET_SCHEME_OPTIONS);
+            unsafe { cef::scheme::register_custom_scheme(registrar, ASSET_SCHEME, ASSET_SCHEME_OPTIONS) };
         if !result {
             error_message_box(
                 "CEF renderer error",
@@ -256,6 +268,12 @@ impl RenderProcessHandler for Application {
 fn main() {
     unsafe {
         ShowWindow(GetConsoleWindow(), 0);
+    }
+
+    // GPU-процесс Chromium рисует интерфейс на видеокарте — пусть получает её раньше игры без
+    // ограничения FPS (ipc::priority). Процессам страниц приоритет не трогаем.
+    if std::env::args().any(|arg| arg == "--type=gpu-process") {
+        ipc::priority::raise_current(false);
     }
 
     let instance = unsafe { GetModuleHandleA(std::ptr::null()) };

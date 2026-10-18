@@ -137,6 +137,36 @@ fn main() {
     drop(guard);
     let _ = std::fs::write("host_smoke.bmp", bmp);
 
+    // Частота кадров интерфейса: вторая страница во весь «экран» 1920×1080 с анимацией на каждом
+    // кадре (как перетаскивание карты — меняется весь кадр). Забираем кадры, как игра, 4 с.
+    const AW: u32 = 1920;
+    const AH: u32 = 1080;
+    const ANIM: &str = "data:text/html,<html><body style='margin:0;overflow:hidden'>\
+<div id='a' style='position:absolute;inset:0'></div><script>var t=0;function f(){t++;\
+document.getElementById('a').style.background='linear-gradient('+(t%360)+'deg,rgb(255,0,0),rgb(0,0,255))';\
+requestAnimationFrame(f);}requestAnimationFrame(f);</script></body></html>";
+    writer.send(&ToHost::FrameRate(240));
+    let anim_name = ipc::surface::name(std::process::id(), 2, 1);
+    let anim = Surface::create(&anim_name, AW, AH).expect("общая память 2");
+    writer.send(&ToHost::CreateBrowser { id: 2, url: ANIM.into(), surface: anim_name, width: AW, height: AH, hidden: false });
+    wait(&rx, "анимированная страница", 20, |m| matches!(m, ToGame::BrowserCreated { id: 2, .. }));
+    std::thread::sleep(Duration::from_millis(1000));
+    let (mut frames, mut pixels) = (0u64, 0u64);
+    let measure = Instant::now();
+    while measure.elapsed() < Duration::from_secs(4) {
+        if let Some(guard) = anim.try_lock() {
+            if let Some(rect) = guard.take_dirty() {
+                frames += 1;
+                pixels += (rect.width.max(0) * rect.height.max(0)) as u64;
+            }
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    let fps = frames as f64 / measure.elapsed().as_secs_f64();
+    println!("  кадров интерфейса 1920x1080 с анимацией: {:.1} к/с (в среднем {:.0}% кадра за раз)", fps,
+        if frames > 0 { 100.0 * pixels as f64 / frames as f64 / (AW * AH) as f64 } else { 0.0 });
+    writer.send(&ToHost::DestroyBrowser { id: 2 });
+
     // Закрыли канал — хост должен выйти сам
     drop(writer);
     let process = Handle(pi.hProcess);

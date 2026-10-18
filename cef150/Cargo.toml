@@ -1,0 +1,13 @@
+[package]
+name = "cef150"
+version = "0.1.0"
+authors = ["ZOTTCE <zottce@gmail.com>"]
+edition = "2024"
+rust-version = "1.93"
+
+[dependencies]
+cef-sys = { package = "cef-sys150", path = "../cef-sys150" }
+widestring = "1.2.1"
+
+[dev-dependencies]
+testdrop = "0.1.2"

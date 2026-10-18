@@ -12,6 +12,7 @@ use ipc::{KeyEvent, ToHost, Value};
 pub use ipc::MouseButton as MouseKey;
 
 use crate::app::{Event, ExternalBrowser};
+use crate::browser::engine::{self, Engine};
 use crate::browser::host::{self, HostProcess};
 use crate::browser::view::View;
 use crate::external::BrowserReadyCallback;
@@ -32,6 +33,14 @@ struct Remote {
 
 pub struct Manager {
     host: Option<HostProcess>,
+    /// Какой хост (engine.rs); при сбое современного — до конца игры совместимый
+    engine: Engine,
+    /// Номер запуска хоста: события от прежнего (убитого) отбрасываются
+    host_generation: u32,
+    /// Когда запущен хост, который ещё не прислал Ready
+    host_started_at: Option<Instant>,
+    /// Падения современного хоста (для «дважды за 2 минуты»)
+    modern_crashes: Vec<Instant>,
     host_ready: bool,
     cef_running: bool,
     respawn_at: Option<Instant>,
@@ -56,6 +65,10 @@ impl Manager {
     pub fn new(event_tx: Sender<Event>) -> Manager {
         Manager {
             host: None,
+            engine: Engine::Legacy,
+            host_generation: 0,
+            host_started_at: None,
+            modern_crashes: Vec::new(),
             host_ready: false,
             cef_running: false,
             respawn_at: None,
@@ -92,15 +105,42 @@ impl Manager {
             return;
         }
         self.cef_running = true;
+        self.engine = engine::choose();
         self.spawn_host();
     }
 
     fn spawn_host(&mut self) {
-        self.host = host::spawn(self.event_tx.clone());
+        self.host_generation = self.host_generation.wrapping_add(1);
+        self.host = host::spawn(self.event_tx.clone(), &self.engine.dir(), self.host_generation);
         self.host_ready = false;
+        self.host_started_at = Some(Instant::now());
         if self.host.is_none() {
+            if self.engine == Engine::Modern {
+                self.fall_back("cef-modern\\cef_host.exe не запустился");
+                return;
+            }
             self.respawn_at = Some(Instant::now() + RESPAWN_DELAY);
         }
+    }
+
+    /// Событие от текущего хоста, а не от прежнего.
+    pub fn is_current_host(&self, generation: u32) -> bool {
+        generation == self.host_generation
+    }
+
+    /// Современный хост не работает: запомнить (engine.rs) и сразу запустить совместимый.
+    fn fall_back(&mut self, reason: &str) {
+        engine::disable_modern(reason);
+        if let Some(host) = self.host.take() {
+            host.kill();
+        }
+        self.engine = Engine::Legacy;
+        self.modern_crashes.clear();
+        for remote in self.browsers.values_mut() {
+            remote.loaded = false;
+        }
+        self.respawn_at = None;
+        self.spawn_host();
     }
 
     pub fn shutdown_cef(&mut self) {
@@ -113,6 +153,9 @@ impl Manager {
     /// Хост запустил CEF. После перезапуска хоста — заново создаём браузеры, что были.
     pub fn on_host_ready(&mut self) {
         self.host_ready = true;
+        if let Some(started) = self.host_started_at.take() {
+            log::info!("хост интерфейса готов за {:?}: {}", started.elapsed(), self.engine.name());
+        }
         self.prev_fps = 0;
 
         let creates: Vec<ToHost> = self
@@ -132,7 +175,20 @@ impl Manager {
         }
     }
 
-    pub fn on_host_lost(&mut self) {
+    pub fn on_host_lost(&mut self, generation: u32) {
+        if generation != self.host_generation {
+            return; // прежний хост, его уже заменили
+        }
+        if self.engine == Engine::Modern && self.cef_running {
+            let now = Instant::now();
+            self.modern_crashes.retain(|at| now.duration_since(*at) < engine::MODERN_CRASH_WINDOW);
+            self.modern_crashes.push(now);
+            if self.modern_crashes.len() >= 2 || !self.host_ready {
+                let reason = if self.host_ready { "упал дважды за 2 минуты" } else { "упал при запуске" };
+                self.fall_back(reason);
+                return;
+            }
+        }
         log::error!("cef_host.exe завершился — перезапуск через {:?}", RESPAWN_DELAY);
         self.host = None;
         self.host_ready = false;
@@ -146,6 +202,13 @@ impl Manager {
 
     /// Каждый кадр: перезапуск упавшего хоста.
     pub fn tick(&mut self) {
+        if self.engine == Engine::Modern
+            && !self.host_ready
+            && self.host.is_some()
+            && self.host_started_at.is_some_and(|at| at.elapsed() >= engine::MODERN_START_TIMEOUT)
+        {
+            self.fall_back("не ответил за 20 с");
+        }
         if let Some(at) = self.respawn_at
             && Instant::now() >= at
             && self.cef_running

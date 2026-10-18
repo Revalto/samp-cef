@@ -5,7 +5,16 @@ authors = ["ZOTTCE <zottce@gmail.com>"]
 edition = "2024"
 rust-version = "1.93"
 
+# Как у host: legacy — CEF 89 (cef\), modern — CEF 150 (cef-modern\)
+[features]
+default = ["legacy"]
+legacy = ["dep:cef89", "dep:cef_sys89"]
+modern = ["dep:cef150", "dep:cef_sys150"]
+
 [dependencies]
-cef = { path = "../cef" }
-cef-sys = { path = "../cef-sys" }
+cef89 = { package = "cef", path = "../cef", optional = true }
+cef_sys89 = { package = "cef-sys", path = "../cef-sys", optional = true }
+cef150 = { package = "cef150", path = "../cef150", optional = true }
+cef_sys150 = { package = "cef-sys150", path = "../cef-sys150", optional = true }
+ipc = { path = "../ipc" }
 winapi = { version = "0.3.9", features = ["libloaderapi", "winuser", "wincon"] }

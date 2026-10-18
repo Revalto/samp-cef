@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 
 use winapi::shared::minwindef::{FALSE, TRUE};
-use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
+use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess};
 use winapi::um::winbase::CREATE_NO_WINDOW;
 
 use ipc::channel::{Handle, Writer, create_pipe};
@@ -17,7 +17,7 @@ use crate::app::Event;
 
 pub struct HostProcess {
     writer: Arc<Writer>,
-    _process: Handle,
+    process: Handle,
 }
 
 impl HostProcess {
@@ -25,12 +25,21 @@ impl HostProcess {
     pub fn send(&self, message: &ToHost) -> bool {
         self.writer.send(message)
     }
+
+    /// Завис при запуске (переход на совместимый хост): закрыть канал мало — CEF может не
+    /// дойти до чтения.
+    pub fn kill(&self) {
+        unsafe {
+            TerminateProcess(self.process.raw(), 1);
+        }
+    }
 }
 
-/// Запускает cef/cef_host.exe. Сообщения хоста приходят в `event_tx` как `Event::Host`,
-/// обрыв связи — `Event::HostLost`.
-pub fn spawn(event_tx: Sender<Event>) -> Option<HostProcess> {
-    let exe = crate::utils::cef_dir().join("cef_host.exe");
+/// Запускает cef_host.exe из `dir` (engine.rs: cef-modern\ или cef\). Сообщения хоста приходят в
+/// `event_tx` как `Event::Host`, обрыв связи — `Event::HostLost`; `generation` — номер запуска:
+/// события от прежнего (убитого) хоста менеджер отбрасывает.
+pub fn spawn(event_tx: Sender<Event>, dir: &std::path::Path, generation: u32) -> Option<HostProcess> {
+    let exe = dir.join("cef_host.exe");
 
     // Игра → хост: хост наследует конец для чтения. Хост → игра: конец для записи.
     let (child_in, to_host) = create_pipe(true)?;
@@ -44,7 +53,7 @@ pub fn spawn(event_tx: Sender<Event>) -> Option<HostProcess> {
     );
     let mut command: Vec<u16> = std::ffi::OsStr::new(&command).encode_wide().chain(Some(0)).collect();
     let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-    let dir: Vec<u16> = crate::utils::cef_dir().as_os_str().encode_wide().chain(Some(0)).collect();
+    let dir: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
 
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -83,13 +92,13 @@ pub fn spawn(event_tx: Sender<Event>) -> Option<HostProcess> {
 
     std::thread::spawn(move || {
         ipc::channel::read_loop::<ToGame>(&from_host, |message| {
-            let _ = event_tx.send(Event::Host(message));
+            let _ = event_tx.send(Event::Host(generation, message));
         });
-        let _ = event_tx.send(Event::HostLost);
+        let _ = event_tx.send(Event::HostLost(generation));
     });
 
     Some(HostProcess {
         writer: Arc::new(Writer::new(to_host)),
-        _process: process,
+        process,
     })
 }

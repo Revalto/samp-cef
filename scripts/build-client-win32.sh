@@ -89,8 +89,28 @@ export LIB="${DX_SDK_LIB}${LIB:+;$LIB}"
 # export CFLAGS_i686_pc_windows_msvc="${CFLAGS_i686_pc_windows_msvc:-} /FIstring.h /DHAVE_STRING_H=1"
 
 echo "Building Windows client artifacts for $TARGET"
+# Совместимый режим: CEF 89 (папка игры cef\) + игровая часть (client.dll, loader)
 cargo xwin build --release --target "$TARGET" \
   -p client -p renderer -p loader -p host \
+  --xwin-arch x86,x86_64 \
+  --cross-compiler clang-cl \
+  --xwin-cache-dir .xwin/
+
+# Современный режим: хост и процессы страниц на CEF 150 (папка игры cef-modern\).
+# Дистрибутив CEF 150 — тот, под который сгенерированы биндинги cef-sys150 (cef-distribution.json).
+CEF150_ROOT_DIR="${CEF150_PATH:-$ROOT_DIR/third_party/cef150}"
+CEF150_NAME="cef_binary_150.0.11+gb887805+chromium-150.0.7871.115_windows32"
+CEF150_URL="https://cef-builds.spotifycdn.com/cef_binary_150.0.11%2Bgb887805%2Bchromium-150.0.7871.115_windows32.tar.bz2"
+if [ ! -f "$CEF150_ROOT_DIR/$CEF150_NAME/Release/libcef.lib" ]; then
+  mkdir -p "$CEF150_ROOT_DIR"
+  echo "Downloading CEF 150 to $CEF150_ROOT_DIR"
+  curl -L "$CEF150_URL" -o "$CEF150_ROOT_DIR/cef150.tar.bz2"
+  tar xjf "$CEF150_ROOT_DIR/cef150.tar.bz2" -C "$CEF150_ROOT_DIR"
+fi
+export CEF150_PATH="$CEF150_ROOT_DIR/$CEF150_NAME"
+cargo xwin build --release --target "$TARGET" \
+  -p renderer -p host --no-default-features --features modern \
+  --target-dir target-modern \
   --xwin-arch x86,x86_64 \
   --cross-compiler clang-cl \
   --xwin-cache-dir .xwin/

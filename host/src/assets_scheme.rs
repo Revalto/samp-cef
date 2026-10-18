@@ -172,7 +172,9 @@ impl AssetResourceHandler {
 }
 
 pub fn register_custom_scheme(registrar: *mut cef_scheme_registrar_t) {
-    let result = cef::scheme::register_custom_scheme(registrar, ASSET_SCHEME, ASSET_SCHEME_OPTIONS);
+    // В CEF 150 функция unsafe (registrar — тот, что передал CEF), в CEF 89 — обычная
+    #[allow(unused_unsafe)]
+    let result = unsafe { cef::scheme::register_custom_scheme(registrar, ASSET_SCHEME, ASSET_SCHEME_OPTIONS) };
     log::trace!("register_custom_scheme => {}", result);
 }
 

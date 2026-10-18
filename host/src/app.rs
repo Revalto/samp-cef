@@ -27,28 +27,42 @@ pub enum RenderMode {
     Shared,
 }
 
-impl RenderMode {
-    /// `render = auto | gpu | cpu`; нет файла или строки — auto.
-    pub fn from_config() -> RenderMode {
-        let text = std::fs::read_to_string(crate::paths::cef_dir().join("cef_host.ini")).unwrap_or_default();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with(';') || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=')
-                && key.trim().eq_ignore_ascii_case("render")
-            {
-                return match value.trim().to_ascii_lowercase().as_str() {
-                    "gpu" => RenderMode::Gpu,
-                    "cpu" => RenderMode::Cpu,
-                    "shared" => RenderMode::Shared,
-                    _ => RenderMode::Auto,
-                };
-            }
+/// Значение `key = value` из cef\cef_host.ini (cef-modern\cef_host.ini у современного хоста).
+pub fn config_value(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::paths::cef_dir().join("cef_host.ini")).unwrap_or_default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(';') || line.starts_with('#') {
+            continue;
         }
-        RenderMode::Auto
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case(name)
+        {
+            return Some(value.trim().to_string());
+        }
     }
+    None
+}
+
+impl RenderMode {
+    /// `render = auto | gpu | cpu | shared`; нет файла или строки — shared на CEF 150 (там общая
+    /// текстура работает), auto на CEF 89.
+    pub fn from_config() -> RenderMode {
+        match config_value("render").map(|v| v.to_ascii_lowercase()).as_deref() {
+            Some("gpu") => RenderMode::Gpu,
+            Some("cpu") => RenderMode::Cpu,
+            Some("shared") => RenderMode::Shared,
+            Some("auto") => RenderMode::Auto,
+            _ if cfg!(feature = "modern") => RenderMode::Shared,
+            _ => RenderMode::Auto,
+        }
+    }
+}
+
+/// Лимит кучи JS (МБ): без него V8 растёт до сотен мегабайт и подолгу собирает мусор (рывки).
+/// `js_heap_mb` в cef_host.ini.
+fn js_heap_mb() -> u32 {
+    config_value("js_heap_mb").and_then(|v| v.parse().ok()).unwrap_or(384)
 }
 
 #[derive(Clone)]
@@ -89,6 +103,22 @@ impl App for HostApp {
         command_line.append_switch("enable-begin-frame-scheduling");
         command_line.append_switch_with_value("autoplay-policy", "no-user-gesture-required");
         command_line.append_switch("enable-media-stream");
+        // Не ждать вертикальную синхронизацию в GPU-процессе: кадр уходит в игру, а не на экран
+        command_line.append_switch("disable-gpu-vsync");
+        // Лишнее для интерфейса игры: изоляция сайтов по процессам (каждая — свой renderer.exe и
+        // память), перевод, трансляции, подсказки, расчёт перекрытия окон (без окна — бессмысленно),
+        // проверка подписи модулей в рендерере (с «Целостностью памяти» Windows 11 мешает загрузке)
+        command_line.append_switch_with_value(
+            "disable-features",
+            "CalculateNativeWinOcclusion,IsolateOrigins,site-per-process,Translate,MediaRouter,\
+             OptimizationHints,RendererCodeIntegrity,BackForwardCache,HardwareMediaKeyHandling",
+        );
+        command_line.append_switch_with_value("js-flags", &format!("--max-old-space-size={}", js_heap_mb()));
+        // GPU-процесс в самом хосте (`gpu_process = inprocess`): меньше пересылок между процессами,
+        // но падение драйвера роняет хост (игра перезапустит его через 3 с)
+        if config_value("gpu_process").is_some_and(|v| v.eq_ignore_ascii_case("inprocess")) {
+            command_line.append_switch("in-process-gpu");
+        }
     }
 
     fn on_register_custom_schemes(&self, registrar: *mut cef_sys::cef_scheme_registrar_t) {
@@ -106,11 +136,9 @@ pub fn initialize(writer: Arc<Writer>, render: RenderMode) {
     let mut settings = unsafe { std::mem::zeroed::<cef_sys::cef_settings_t>() };
 
     let subprocess = cef::types::string::into_cef_string(&dir.join("renderer.exe").to_string_lossy());
-    let cache = cef::types::string::into_cef_string(&dir.join("cache").to_string_lossy());
     let locales = cef::types::string::into_cef_string(&dir.join("locales").to_string_lossy());
     let resources = cef::types::string::into_cef_string(&dir.to_string_lossy());
     let log_file = cef::types::string::into_cef_string(&dir.join("cef.log").to_string_lossy());
-    let user_data = cef::types::string::into_cef_string(&dir.join("user_data").to_string_lossy());
 
     settings.size = std::mem::size_of::<cef_sys::cef_settings_t>();
     settings.no_sandbox = 1;
@@ -118,12 +146,24 @@ pub fn initialize(writer: Arc<Writer>, render: RenderMode) {
     settings.windowless_rendering_enabled = 1;
     settings.multi_threaded_message_loop = 1;
     settings.log_severity = cef_sys::cef_log_severity_t::LOGSEVERITY_ERROR;
-    settings.cache_path = cache;
     settings.locales_dir_path = locales;
     settings.resources_dir_path = resources;
-    settings.ignore_certificate_errors = 1;
     settings.log_file = log_file;
-    settings.user_data_path = user_data;
+
+    // CEF 150: кэш обязан лежать внутри root_cache_path; user_data_path и
+    // ignore_certificate_errors убраны (сертификаты — OnCertificateError, у нас только свои адреса)
+    #[cfg(feature = "modern")]
+    {
+        let root = dir.join("user_data");
+        settings.root_cache_path = cef::types::string::into_cef_string(&root.to_string_lossy());
+        settings.cache_path = cef::types::string::into_cef_string(&root.join("cache").to_string_lossy());
+    }
+    #[cfg(not(feature = "modern"))]
+    {
+        settings.cache_path = cef::types::string::into_cef_string(&dir.join("cache").to_string_lossy());
+        settings.ignore_certificate_errors = 1;
+        settings.user_data_path = cef::types::string::into_cef_string(&dir.join("user_data").to_string_lossy());
+    }
 
     cef::initialize(Some(&main_args), &settings, Some(HostApp { writer, render }));
 }

@@ -1,0 +1,10 @@
+[package]
+name = "cef-sys150"
+version = "0.1.0"
+authors = ["ZOTTCE <zottce@gmail.com>"]
+edition = "2024"
+rust-version = "1.93"
+build = "build.rs"
+
+[dependencies]
+winapi = { version = "0.3.9", features = ["winuser", "windef"] }

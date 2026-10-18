@@ -11,6 +11,7 @@
 
 pub mod channel;
 pub mod message;
+pub mod priority;
 pub mod stats;
 pub mod surface;
 

@@ -6,11 +6,29 @@
 
 #![windows_subsystem = "windows"]
 
+// Одна из двух версий CEF под общими именами `cef` / `cef_sys` (Cargo.toml: legacy / modern)
+#[cfg(feature = "modern")]
+extern crate cef150 as cef;
+#[cfg(feature = "modern")]
+extern crate cef_sys150 as cef_sys;
+#[cfg(not(feature = "modern"))]
+extern crate cef89 as cef;
+#[cfg(not(feature = "modern"))]
+extern crate cef_sys89 as cef_sys;
+
 mod app;
 mod assets_scheme;
 mod gpu;
+#[cfg(feature = "modern")]
+mod pacing;
 mod paths;
 mod view;
+
+/// Версия CEF этой сборки — для логов (и cef_client.log игры)
+#[cfg(feature = "modern")]
+pub const ENGINE: &str = "CEF 150 (современный режим, cef-modern)";
+#[cfg(not(feature = "modern"))]
+pub const ENGINE: &str = "CEF 89 (совместимый режим)";
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -31,8 +49,9 @@ const DEFAULT_FRAME_RATE: i32 = 60;
 
 struct Host {
     writer: Arc<Writer>,
-    views: Mutex<HashMap<u32, Arc<View>>>,
-    frame_rate: AtomicI32,
+    views: Arc<Mutex<HashMap<u32, Arc<View>>>>,
+    /// Частота кадров игры (ToHost::FrameRate) — по ней темп кадров интерфейса (pacing.rs)
+    frame_rate: Arc<AtomicI32>,
     /// render = shared и устройство D3D11 создалось
     gpu: Option<Arc<gpu::Device>>,
 }
@@ -74,7 +93,7 @@ impl Host {
                 if let Some(old) = self.views.lock().insert(id, view.clone()) {
                     old.close();
                 }
-                create_browser(ViewRef(view), &url, self.gpu.is_some());
+                create_browser(ViewRef(view), &url, self.gpu.is_some(), external_begin_frame(self.gpu.is_some()));
             }
 
             ToHost::Resize { id, surface, width, height } => {
@@ -157,10 +176,27 @@ impl Host {
     }
 }
 
-fn create_browser(view: ViewRef, url: &str, shared_texture: bool) {
+/// Кадры по запросу хоста (pacing.rs), а не по таймеру Chromium: только CEF 150 с общей
+/// текстурой (таймер Chromium отдаёт не больше 60 к/с; на CEF 89 кадр всё равно упирается в чтение).
+fn external_begin_frame(shared_texture: bool) -> bool {
+    cfg!(feature = "modern") && shared_texture && pacing_enabled()
+}
+
+/// `pacing = external | timer` в cef_host.ini (по умолчанию external)
+fn pacing_enabled() -> bool {
+    !app::config_value("pacing").is_some_and(|v| v.eq_ignore_ascii_case("timer"))
+}
+
+fn create_browser(view: ViewRef, url: &str, shared_texture: bool, external_begin_frame: bool) {
     let mut window_info = unsafe { std::mem::zeroed::<cef_sys::cef_window_info_t>() };
+    #[cfg(feature = "modern")]
+    {
+        window_info.size = std::mem::size_of::<cef_sys::cef_window_info_t>();
+    }
     window_info.windowless_rendering_enabled = 1;
     window_info.shared_texture_enabled = shared_texture as i32;
+    window_info.external_begin_frame_enabled = external_begin_frame as i32;
+    view.0.set_external_begin_frame(external_begin_frame);
 
     let url = crate::assets_scheme::resolve_browser_url(url);
     let url = CefString::new(&url);
@@ -200,6 +236,9 @@ fn arg(name: &str) -> Option<String> {
 
 fn main() {
     initialize_logging();
+    log::info!("{}", ENGINE);
+    // Интерфейс получает видеокарту раньше игры без ограничения FPS (ipc::priority)
+    log::info!("приоритет хоста: {}", ipc::priority::raise_current(true));
 
     let (Some(input), Some(output)) = (
         arg("--in").and_then(|a| Handle::from_arg(&a)),
@@ -225,10 +264,14 @@ fn main() {
 
     let host = Host {
         writer: writer.clone(),
-        views: Mutex::new(HashMap::new()),
-        frame_rate: AtomicI32::new(DEFAULT_FRAME_RATE),
+        views: Arc::new(Mutex::new(HashMap::new())),
+        frame_rate: Arc::new(AtomicI32::new(DEFAULT_FRAME_RATE)),
         gpu,
     };
+    #[cfg(feature = "modern")]
+    if external_begin_frame(host.gpu.is_some()) {
+        pacing::start(host.views.clone(), host.frame_rate.clone());
+    }
     app::initialize(writer, render);
     log::info!("CEF запущен, ждём команды игры");
 
