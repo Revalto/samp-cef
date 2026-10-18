@@ -9,6 +9,8 @@
 //! * `DELIRIUM_CEF_ENGINE=legacy | modern | auto` — переменная окружения игры, её ставит лаунчер
 //!   (галочка «Совместимый режим интерфейса»); нет — `engine` из `cef\cef_host.ini` (его раздаёт
 //!   лаунчер — так мы можем вернуть всех на совместимый без новой сборки); нет и там — auto;
+//! * файл `cef-modern\force.txt` (его нет в раздаче — лаунчер не трогает) — современный, важнее
+//!   всего остального, кроме отметки сбоя: для проверки на своём ПК;
 //! * auto — современный, если он есть и не отключён после сбоя (`cef-modern\disabled.txt`);
 //! * сбой современного (не запустился, не ответил за [`MODERN_START_TIMEOUT`], упал дважды за
 //!   [`MODERN_CRASH_WINDOW`]) — до конца игры совместимый (manager.rs), а в `disabled.txt` —
@@ -79,12 +81,19 @@ pub fn choose() -> Engine {
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty() && v != "auto");
-    let source = if from_env.is_some() { "DELIRIUM_CEF_ENGINE" } else { "cef_host.ini" };
-    let wanted = from_env.or_else(ini_engine).unwrap_or_default();
+    let forced = Engine::Modern.dir().join("force.txt").exists();
+    let source = if forced {
+        "cef-modern\\force.txt"
+    } else if from_env.is_some() {
+        "DELIRIUM_CEF_ENGINE"
+    } else {
+        "cef_host.ini"
+    };
+    let wanted = if forced { Some("modern".to_string()) } else { from_env }.or_else(ini_engine).unwrap_or_default();
     let available = stamp().is_some();
     let engine = match wanted.as_str() {
         "legacy" => Engine::Legacy,
-        "modern" if available => Engine::Modern,
+        "modern" if available && !(forced && modern_disabled()) => Engine::Modern,
         _ if available && !modern_disabled() => Engine::Modern,
         _ => Engine::Legacy,
     };
