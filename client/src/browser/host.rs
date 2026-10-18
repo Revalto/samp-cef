@@ -82,7 +82,8 @@ pub fn spawn(event_tx: Sender<Event>, dir: &std::path::Path, generation: u32) ->
     let (from_host, child_out) = create_pipe(false)?;
 
     let command = format!(
-        "\"{}\" --in {} --out {}",
+        // --do-not-de-elevate: игра от администратора — без него CEF 150 не запускается (host/src/app.rs)
+        "\"{}\" --in {} --out {} --do-not-de-elevate",
         exe.display(),
         child_in.as_arg(),
         child_out.as_arg()

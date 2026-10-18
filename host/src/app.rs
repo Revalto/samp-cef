@@ -114,13 +114,18 @@ impl App for HostApp {
         command_line.append_switch("enable-media-stream");
         // Не ждать вертикальную синхронизацию в GPU-процессе: кадр уходит в игру, а не на экран
         command_line.append_switch("disable-gpu-vsync");
+        // Игру часто запускают от администратора (режим совместимости gta_sa.exe), хост это
+        // наследует — Chromium 150 тогда не запускается, а пробует перезапуститься без прав
+        // (cef_get_exit_code 38, NORMAL_EXIT_AUTO_DE_ELEVATED). Ключ есть и в командной строке
+        // хоста (client/src/browser/host.rs) — проверка может идти раньше этого места
+        command_line.append_switch("do-not-de-elevate");
         // Лишнее для интерфейса игры: изоляция сайтов по процессам (каждая — свой renderer.exe и
         // память), перевод, трансляции, подсказки, расчёт перекрытия окон (без окна — бессмысленно),
         // проверка подписи модулей в рендерере (с «Целостностью памяти» Windows 11 мешает загрузке)
         command_line.append_switch_with_value(
             "disable-features",
             "CalculateNativeWinOcclusion,IsolateOrigins,site-per-process,Translate,MediaRouter,\
-             OptimizationHints,RendererCodeIntegrity,BackForwardCache,HardwareMediaKeyHandling",
+             OptimizationHints,RendererCodeIntegrity,BackForwardCache,HardwareMediaKeyHandling,AutoDeElevate",
         );
         command_line.append_switch_with_value("js-flags", &format!("--max-old-space-size={}", js_heap_mb()));
         // GPU-процесс в самом хосте (`gpu_process = inprocess`): меньше пересылок между процессами,
