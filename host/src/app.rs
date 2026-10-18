@@ -184,5 +184,19 @@ pub fn initialize(writer: Arc<Writer>, render: RenderMode) {
 
     log::info!("cef::initialize: папка {}, процессы страниц {}", dir.display(), dir.join("renderer.exe").display());
     let result = cef::initialize(Some(&main_args), &settings, Some(HostApp { writer, render }));
+    #[cfg(feature = "modern")]
+    if result == 0 {
+        // Причина отказа (ResultCode Chromium): 21 — кэш занят другим процессом CEF, 1001+ — CEF
+        let code = unsafe { cef_sys::cef_get_exit_code() };
+        log::error!("cef::initialize отказал, код {}; окружение: {}", code, env_names());
+    }
     log::info!("cef::initialize вернул {}", result);
+}
+
+/// Имена переменных окружения хоста (без значений) — для лога.
+#[cfg_attr(not(feature = "modern"), allow(dead_code))]
+fn env_names() -> String {
+    let mut names: Vec<String> = std::env::vars_os().map(|(n, _)| n.to_string_lossy().into_owned()).collect();
+    names.sort();
+    names.join(" ")
 }

@@ -50,7 +50,13 @@ impl HostProcess {
 fn host_environment() -> Vec<u16> {
     let mut block = Vec::new();
     for (name, value) in std::env::vars_os() {
-        if name.to_string_lossy().eq_ignore_ascii_case("__COMPAT_LAYER") {
+        // Лаунчер — Electron (сам Chromium): его переменные (ELECTRON_*, CHROME_*, GOOGLE_*,
+        // NODE_*) доходят через игру до хоста, и CEF 150 может принять их на свой счёт
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if upper == "__COMPAT_LAYER"
+            || ["ELECTRON_", "CHROME_", "GOOGLE_", "NODE_", "ORIGINAL_XDG"].iter().any(|p| upper.starts_with(p))
+        {
+            log::info!("окружение хоста: без {}", name.to_string_lossy());
             continue;
         }
         block.extend(name.encode_wide());
