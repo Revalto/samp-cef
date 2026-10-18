@@ -116,12 +116,27 @@ unsafe extern "system" fn on_paint<I: RenderHandler>(
     }
 }
 
-unsafe extern "system" fn on_accelerated_paint(
-    _this: *mut cef_render_handler_t, _browser: *mut cef_browser_t,
-    _type_: cef_paint_element_type_t::Type, _dirty_rects_count: usize,
-    _dirty_rects: *const cef_rect_t, _shared_handle: *mut ::std::os::raw::c_void,
+unsafe extern "system" fn on_accelerated_paint<I: RenderHandler>(
+    this: *mut cef_render_handler_t, browser: *mut cef_browser_t,
+    type_: cef_paint_element_type_t::Type, dirty_rects_count: usize,
+    dirty_rects: *const cef_rect_t, shared_handle: *mut ::std::os::raw::c_void,
 ) {
-    println!("accelerated");
+    unsafe {
+        if browser.is_null() || shared_handle.is_null() || (dirty_rects_count > 0 && dirty_rects.is_null()) {
+            return;
+        }
+
+        let obj: &mut Wrapper<_, I> = Wrapper::unwrap(this);
+        let browser = Browser::from_raw_borrowed(browser);
+        let rects = std::slice::from_raw_parts(dirty_rects, dirty_rects_count);
+        let rects = DirtyRects {
+            count: dirty_rects_count,
+            rects: Vec::from(rects),
+        };
+
+        obj.interface
+            .on_accelerated_paint(browser, PaintElement::from(type_), rects, shared_handle);
+    }
 }
 
 #[allow(dead_code)]
@@ -189,7 +204,7 @@ pub fn wrap<T: RenderHandler>(object: T) -> *mut cef_render_handler_t {
     cef_object.on_popup_show = Some(on_popup_show::<T>);
     cef_object.on_popup_size = Some(on_popup_size::<T>);
     cef_object.on_paint = Some(on_paint::<T>);
-    cef_object.on_accelerated_paint = Some(on_accelerated_paint);
+    cef_object.on_accelerated_paint = Some(on_accelerated_paint::<T>);
     // cef_object.on_cursor_change = Some(on_cursor_change::<T>);
     cef_object.start_dragging = Some(start_dragging);
     cef_object.update_drag_cursor = Some(update_drag_cursor::<T>);

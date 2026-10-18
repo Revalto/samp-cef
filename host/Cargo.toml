@@ -1,0 +1,23 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+# cef_host.exe — процесс браузера. CEF (libcef.dll), его кучи и кадры живут здесь, а не в
+# 32-битной игре. Игра (client.dll) запускает его и общается через крейт ipc.
+
+[[bin]]
+name = "cef_host"
+path = "src/main.rs"
+
+[dependencies]
+cef = { path = "../cef" }
+cef-sys = { path = "../cef-sys" }
+ipc = { path = "../ipc" }
+winapi = { version = "0.3.9", features = ["libloaderapi", "winuser", "processthreadsapi", "synchapi", "winbase", "handleapi", "d3d11", "d3dcommon", "dxgi", "dxgiformat", "dxgitype", "winerror", "unknwnbase"] }
+log = "0.4.29"
+simplelog = "0.12.2"
+parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
+url = "2.5.7"

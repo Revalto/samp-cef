@@ -45,6 +45,14 @@ pub trait RenderHandler {
         &self, browser: Browser, paint_type: PaintElement, dirty_rects: DirtyRects, buffer: &[u8],
         width: usize, height: usize,
     );
+
+    /// Кадр текстурой на видеокарте (window_info.shared_texture_enabled): `shared_handle` —
+    /// общий дескриптор ID3D11Texture2D (OpenSharedResource), действителен только внутри вызова.
+    fn on_accelerated_paint(
+        &self, _browser: Browser, _paint_type: PaintElement, _dirty_rects: DirtyRects,
+        _shared_handle: *mut std::ffi::c_void,
+    ) {
+    }
 }
 
 //pub struct DefaultRenderHandler;

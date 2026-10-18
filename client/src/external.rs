@@ -8,8 +8,9 @@ use std::sync::{
 
 use parking_lot::Mutex;
 
-use cef::types::list::List;
-use cef_sys::cef_list_value_t;
+use ipc::Value;
+
+use crate::list::{self, CefList};
 
 use crossbeam_channel::Sender;
 
@@ -22,7 +23,7 @@ use libloading::{Library, Symbol};
 static PLUGINS: StaticCell<ExternalManager> = StaticCell::new();
 
 pub type BrowserReadyCallback = extern "C" fn(u32);
-pub type EventCallback = extern "C" fn(*const c_char, *mut cef_list_value_t) -> c_int;
+pub type EventCallback = extern "C" fn(*const c_char, *mut CefList) -> c_int;
 pub type CallbackList = Arc<Mutex<HashMap<String, EventCallback>>>;
 
 pub const EXTERNAL_CONTINUE: c_int = 0;
@@ -57,8 +58,8 @@ struct InternalApi {
     cef_destroy_browser: unsafe extern "C" fn(id: u32),
     cef_hide_browser: unsafe extern "C" fn(id: u32, hide: bool),
     cef_focus_browser: unsafe extern "C" fn(id: u32, focus: bool),
-    cef_create_list: unsafe extern "C" fn() -> *mut cef_list_value_t,
-    cef_emit_event: unsafe extern "C" fn(event: *const c_char, list: *mut cef_list_value_t),
+    cef_create_list: unsafe extern "C" fn() -> *mut CefList,
+    cef_emit_event: unsafe extern "C" fn(event: *const c_char, list: *mut CefList),
     cef_subscribe: unsafe extern "C" fn(event: *const c_char, callback: Option<EventCallback>),
     cef_input_available: unsafe extern "C" fn(browser: u32) -> bool,
     cef_ready: unsafe extern "C" fn() -> bool,
@@ -279,23 +280,45 @@ unsafe extern "C" fn cef_focus_browser(id: u32, focus: bool) {
     }
 }
 
-unsafe extern "C" fn cef_create_list() -> *mut cef_list_value_t {
-    let list = List::new();
-    list.into_cef()
+unsafe extern "C" fn cef_create_list() -> *mut CefList {
+    list::create(Vec::new())
 }
 
-unsafe extern "C" fn cef_emit_event(event: *const c_char, list: *mut cef_list_value_t) {
+/// Плагин → JS. Список забираем (как CEF). Через очередь главного цикла: плагин может звать это
+/// откуда угодно, в том числе пока менеджер браузеров занят.
+unsafe extern "C" fn cef_emit_event(event: *const c_char, list: *mut CefList) {
+    let values = unsafe { list::take(list) };
     if event.is_null() {
         return;
     }
 
-    if let Some(list) = List::try_from_raw(list)
-        && let Some(external) = ExternalManager::get()
-    {
-        let manager = external.manager.lock();
-        let name = unsafe { CStr::from_ptr(event) };
-        manager.trigger_event(&name.to_string_lossy(), list);
+    if let Some(external) = ExternalManager::get() {
+        let name = unsafe { CStr::from_ptr(event) }.to_string_lossy().to_string();
+        let _ = external.event_tx.send(Event::EmitEvent(name, values));
     }
+}
+
+/// `cef.emit` из JS → подписчики-плагины. Список для них: [имя, аргументы...], как у CEF.
+/// true — плагин забрал событие (EXTERNAL_BREAK), серверу не отправлять.
+pub fn dispatch_js_event(callbacks: &CallbackList, name: &str, args: &[Value]) -> bool {
+    let Some(callback) = callbacks.lock().get(name).copied() else {
+        return false;
+    };
+    let Ok(c_name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+
+    let mut values = Vec::with_capacity(args.len() + 1);
+    values.push(Value::String(name.to_string()));
+    values.extend_from_slice(args);
+
+    let list = list::create(values);
+    let result = callback(c_name.as_ptr(), list);
+    unsafe {
+        list::release_list(list);
+    }
+
+    result == EXTERNAL_BREAK
 }
 
 unsafe extern "C" fn cef_subscribe(event: *const c_char, callback: Option<EventCallback>) {

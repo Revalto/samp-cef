@@ -184,6 +184,28 @@ impl BrowserHost {
         }
     }
 
+    /// Нажатие с числом кликов (2 — двойной, иначе в странице не бывает dblclick).
+    pub fn send_mouse_click_count(
+        &self, key: cef_sys::cef_mouse_button_type_t::Type, event: cef_mouse_event_t, is_down: bool,
+        click_count: i32,
+    ) {
+        if let Some(smce) = self.inner.send_mouse_click_event {
+            unsafe {
+                let up = if is_down { 0 } else { 1 };
+
+                smce(self.inner.get_mut(), &event, key, up, click_count);
+            }
+        }
+    }
+
+    pub fn send_mouse_wheel_event(&self, event: cef_mouse_event_t, delta: i32) {
+        if let Some(smwe) = self.inner.send_mouse_wheel_event {
+            unsafe {
+                smwe(self.inner.get_mut(), &event, 0, delta * 40);
+            }
+        }
+    }
+
     pub fn send_mouse_wheel(&self, x: i32, y: i32, delta: i32) {
         if let Some(smwe) = self.inner.send_mouse_wheel_event {
             unsafe {

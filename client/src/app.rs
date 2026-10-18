@@ -4,24 +4,19 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use cef::types::list::List;
-use cef_sys::{cef_key_event_t, cef_key_event_type_t};
+use ipc::{KeyEvent, KeyEventKind, ToGame, Value};
 
 use winapi::shared::minwindef::{LPARAM, UINT, WPARAM};
 use winapi::um::winuser::*;
 
-use crate::audio::Audio;
 use crate::browser::manager::{Manager, MouseKey};
 use crate::external::CallbackList;
 use crate::network::NetworkClient;
 use crate::static_cell::StaticCell;
 
-use client_api::gta::camera::CCamera;
 use client_api::gta::menu_manager::CMenuManager;
 use client_api::samp::inputs;
 use client_api::samp::netgame::NetGame;
-use client_api::samp::objects::Object;
-use client_api::samp::players::local_player;
 
 use client_api::wndproc;
 
@@ -55,19 +50,26 @@ pub enum Event {
     DestroyBrowser(u32),
     HideBrowser(u32, bool),
     FocusBrowser(u32, bool),
-    EmitEvent(String, List),
+    /// В JS всех браузеров: от сервера или плагина
+    EmitEvent(String, Vec<Value>),
     EmitEventOnServer(String, String),
     BrowserCreated(u32, i32),
     AppendToObject(u32, i32),
     RemoveFromObject(u32, i32),
     ToggleDevTools(u32, bool),
-    SetAudioSettings(u32, crate::audio::BrowserAudioSettings),
+    /// Звук браузеров на объектах — не поддерживается (браузеры на объектах тоже)
+    SetAudioSettings,
     LoadUrl(u32, String),
 
     CefInitialize,
 
     AlwaysListenKeys(u32, bool),
     Terminate,
+
+    /// Сообщение от cef_host.exe
+    Host(ToGame),
+    /// cef_host.exe завершился
+    HostLost,
 }
 
 #[derive(Debug)]
@@ -88,7 +90,7 @@ pub struct App {
     next_connect_attempt: Instant,
 
     manager: Arc<Mutex<Manager>>,
-    audio: Arc<Audio>,
+    plugins_initialized: bool,
     network: Option<NetworkClient>,
     callbacks: CallbackList,
     keystate_hook: GenericDetour<extern "stdcall" fn(i32) -> u16>,
@@ -113,7 +115,6 @@ impl Drop for App {
         }
 
         self.network.take();
-        self.audio.terminate();
 
         quit();
     }
@@ -132,13 +133,9 @@ impl App {
 
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
-        log::trace!("Audio::new()");
-
-        let audio = Audio::new();
-
         log::trace!("Manager::new()");
 
-        let manager = Arc::new(Mutex::new(Manager::new(event_tx.clone(), audio.clone())));
+        let manager = Arc::new(Mutex::new(Manager::new(event_tx.clone())));
 
         log::trace!("crate::external::initialize");
 
@@ -170,7 +167,7 @@ impl App {
             event_tx,
             event_rx,
             callbacks,
-            audio,
+            plugins_initialized: false,
 
             //
             key_state: [false; 512],
@@ -288,6 +285,37 @@ impl App {
         self.manager.clone()
     }
 
+    /// Сообщение от cef_host.exe (в потоке игры).
+    fn handle_host(&mut self, message: ToGame) {
+        match message {
+            ToGame::Ready => {
+                let _ = self.event_tx.send(Event::CefInitialize);
+            }
+
+            ToGame::BrowserCreated { id, status } => {
+                let _ = self.event_tx.send(Event::BrowserCreated(id, status));
+            }
+
+            ToGame::Focus { id, focus } => {
+                let _ = self.event_tx.send(Event::FocusBrowser(id, focus));
+            }
+
+            ToGame::Hide { id, hide } => {
+                let _ = self.event_tx.send(Event::HideBrowser(id, hide));
+            }
+
+            ToGame::JsEvent { id: _, name, args } => {
+                // Сначала плагины: событие могли перехватить и не отдавать серверу
+                if crate::external::dispatch_js_event(&self.callbacks, &name, &args) {
+                    return;
+                }
+                let _ = self
+                    .event_tx
+                    .send(Event::EmitEventOnServer(name, server_arguments(&args)));
+            }
+        }
+    }
+
     fn get<'a>() -> Option<&'a mut App> {
         unsafe { APP.get_mut() }
     }
@@ -369,11 +397,9 @@ pub fn mainloop() {
             let menu = CMenuManager::get();
             let paused = menu.is_active() || !app.window_focused;
 
-            app.audio.set_paused(paused);
-            app.audio.set_gain(menu.sfx_volume());
-
             let show_cursor = {
                 let mut manager = app.manager.lock();
+                manager.tick();
                 manager.set_corrupted(paused);
                 manager.is_input_blocked() && !menu.is_active()
             };
@@ -387,7 +413,7 @@ pub fn mainloop() {
         while let Ok(event) = app.event_rx.try_recv() {
             match event {
                 Event::AlwaysListenKeys(browser_id, listen) => {
-                    let manager = app.manager.lock();
+                    let mut manager = app.manager.lock();
                     manager.always_listen_keys(browser_id, listen);
                 }
 
@@ -405,7 +431,7 @@ pub fn mainloop() {
 
                     let show_cursor = {
                         let mut manager = app.manager.lock();
-                        manager.create_browser(id, app.callbacks.clone(), &url);
+                        manager.create_browser(id, &url);
                         manager.hide_browser(id, hidden);
                         manager.browser_focus(id, focused);
 
@@ -423,7 +449,7 @@ pub fn mainloop() {
                     );
                     let mut manager = app.manager.lock();
 
-                    manager.create_browser_on_texture(&ext, app.callbacks.clone());
+                    manager.create_browser_on_texture(&ext);
                 }
 
                 Event::DestroyBrowser(id) => {
@@ -432,7 +458,7 @@ pub fn mainloop() {
                 }
 
                 Event::HideBrowser(id, hide) => {
-                    let manager = app.manager.lock();
+                    let mut manager = app.manager.lock();
                     manager.hide_browser(id, hide);
                 }
 
@@ -471,25 +497,27 @@ pub fn mainloop() {
                         network.send(event);
                     }
 
+                    app.manager.lock().on_browser_created(id);
                     crate::external::browser_created(id, code);
                 }
+
+                Event::Host(message) => app.handle_host(message),
+
+                Event::HostLost => app.manager.lock().on_host_lost(),
 
                 Event::CefInitialize => {
                     log::trace!("Initialized. Elapsed: {:?}", app.initialization.elapsed());
 
                     app.cef_ready = true;
-                    crate::external::call_initialize();
+                    app.manager.lock().on_host_ready();
+                    // Хост мог перезапуститься — плагины инициализируем один раз
+                    if !app.plugins_initialized {
+                        app.plugins_initialized = true;
+                        crate::external::call_initialize();
+                    }
                 }
 
-                Event::AppendToObject(browser, object) => {
-                    let mut manager = app.manager.lock();
-                    manager.browser_append_to_object(browser, object);
-                }
-
-                Event::RemoveFromObject(browser, object) => {
-                    let mut manager = app.manager.lock();
-                    manager.browser_remove_from_object(browser, object);
-                }
+                Event::AppendToObject(..) | Event::RemoveFromObject(..) | Event::SetAudioSettings => {}
 
                 Event::ToggleDevTools(browser, enabled) => {
                     let manager = app.manager.lock();
@@ -531,13 +559,8 @@ pub fn mainloop() {
                     app.bump_connect_backoff();
                 }
 
-                Event::SetAudioSettings(browser, audio_settings) => {
-                    let mut manager = app.manager.lock();
-                    manager.set_audio_settings(browser, audio_settings);
-                }
-
                 Event::LoadUrl(browser, url) => {
-                    let manager = app.manager.lock();
+                    let mut manager = app.manager.lock();
                     manager.load_url(browser, &url);
                 }
 
@@ -547,46 +570,22 @@ pub fn mainloop() {
 
         if app.cef_ready && app.connected {
             crate::external::call_mainloop();
-
-            if let Some(local) = local_player() {
-                let position = local.position();
-                let velocity = local.velocity();
-                let matrix = CCamera::get().matrix();
-
-                app.audio.set_position(position);
-                app.audio.set_velocity(velocity);
-                app.audio.set_orientation(matrix);
-
-                let mut manager = app.manager.lock();
-
-                for browser in manager.external_browsers() {
-                    for &object_id in browser.object_ids.iter() {
-                        if let Some(object) = Object::get(object_id) {
-                            let obj_position = object.position();
-                            let velocity = object.velocity();
-                            let heading = object.heading();
-
-                            if client_api::utils::distance(&position, &obj_position)
-                                <= browser.audio_settings.max_distance
-                            {
-                                app.audio.set_object_settings(
-                                    object_id,
-                                    obj_position,
-                                    velocity,
-                                    heading,
-                                    browser.audio_settings,
-                                );
-                            } else {
-                                app.audio.object_mute(object_id);
-                            }
-                        } else {
-                            app.audio.object_mute(object_id);
-                        }
-                    }
-                }
-            }
         }
     }
+}
+
+/// Аргументы события для сервера — строка через пробел, как было в samp-cef.
+fn server_arguments(args: &[Value]) -> String {
+    args.iter()
+        .map(|arg| match arg {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => (if *b { 1 } else { 0 }).to_string(),
+            Value::Double(d) => d.to_string(),
+            Value::Int(i) => i.to_string(),
+            Value::Null => "CEF_NULL".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // TODO: Save key state. Mouse too?
@@ -617,19 +616,20 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
             WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_SYSCHAR | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 let is_system_key = msg == WM_SYSCHAR || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
 
-                let mut event: cef_key_event_t = unsafe { std::mem::zeroed() };
-
-                event.windows_key_code = wparam as i32;
-                event.native_key_code = lparam as i32;
-                event.modifiers = crate::utils::cef_keyboard_modifiers(wparam, lparam);
-                event.is_system_key = if is_system_key { 1 } else { 0 };
+                let mut event = KeyEvent {
+                    kind: KeyEventKind::Char,
+                    modifiers: crate::utils::cef_keyboard_modifiers(wparam, lparam),
+                    windows_key_code: wparam as i32,
+                    native_key_code: lparam as i32,
+                    is_system_key,
+                };
 
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                    event.type_ = cef_key_event_type_t::KEYEVENT_RAWKEYDOWN;
+                    event.kind = KeyEventKind::RawKeyDown;
                 } else if msg == WM_KEYUP || msg == WM_SYSKEYUP {
-                    event.type_ = cef_key_event_type_t::KEYEVENT_KEYUP;
+                    event.kind = KeyEventKind::KeyUp;
                 } else if msg == WM_CHAR || msg == WM_SYSCHAR {
-                    event.type_ = cef_key_event_type_t::KEYEVENT_CHAR;
+                    event.kind = KeyEventKind::Char;
 
                     let bytes = [wparam as u8];
                     if let Some(ch) = encoding_rs::WINDOWS_1251.decode(&bytes).0.chars().next() {
@@ -645,15 +645,14 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
                         let is_allowed_key = wparam == VK_F8 as usize || wparam == VK_F7 as usize;
 
                         if (app.key_state[key_index]
-                            && event.type_ == cef_key_event_type_t::KEYEVENT_KEYUP)
+                            && event.kind == KeyEventKind::KeyUp)
                             || is_allowed_key
                         {
                             app.key_state[key_index] = false;
                             notify_key_down = true;
                         }
-                    } else if event.type_ != cef_key_event_type_t::KEYEVENT_CHAR {
-                        app.key_state[key_index] =
-                            event.type_ == cef_key_event_type_t::KEYEVENT_RAWKEYDOWN;
+                    } else if event.kind != KeyEventKind::Char {
+                        app.key_state[key_index] = event.kind == KeyEventKind::RawKeyDown;
                     }
                 }
 

@@ -9,7 +9,15 @@ use winapi::shared::windef::RECT;
 use winapi::um::shlobj::{CSIDL_MYDOCUMENTS, SHGetFolderPathW};
 use winapi::um::winuser::*;
 
-use cef_sys::cef_event_flags_t::*;
+// cef_event_flags_t (CEF 89). CEF живёт в cef_host.exe — значения повторены здесь
+const EVENTFLAG_CAPS_LOCK_ON: u32 = 1;
+const EVENTFLAG_SHIFT_DOWN: u32 = 2;
+const EVENTFLAG_CONTROL_DOWN: u32 = 4;
+const EVENTFLAG_ALT_DOWN: u32 = 8;
+const EVENTFLAG_NUM_LOCK_ON: u32 = 256;
+const EVENTFLAG_IS_KEY_PAD: u32 = 512;
+const EVENTFLAG_IS_LEFT: u32 = 1024;
+const EVENTFLAG_IS_RIGHT: u32 = 2048;
 
 const CACHE_PATH: &str = "./GTA San Andreas User Files/CEF/";
 
@@ -19,7 +27,7 @@ pub fn is_key_pressed(key: i32) -> bool {
 }
 
 pub fn cef_keyboard_modifiers(wparam: WPARAM, lparam: LPARAM) -> u32 {
-    let mut modifiers = 0;
+    let mut modifiers: u32 = 0;
 
     if is_key_pressed(VK_SHIFT) {
         modifiers |= EVENTFLAG_SHIFT_DOWN;
@@ -97,7 +105,7 @@ pub fn cef_keyboard_modifiers(wparam: WPARAM, lparam: LPARAM) -> u32 {
         _ => (),
     }
 
-    modifiers as u32
+    modifiers
 }
 
 pub fn client_rect() -> [usize; 2] {

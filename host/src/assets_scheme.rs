@@ -453,18 +453,18 @@ fn resolve_relative_local_path(path: &Path) -> Option<PathBuf> {
         (Some(Component::Normal(first)), Some(Component::Normal(second)))
             if component_eq(first, "cef") && component_eq(second, "assets") =>
         {
-            Some(crate::utils::assets_dir().join(components.as_path()))
+            Some(crate::paths::assets_dir().join(components.as_path()))
         }
 
         (Some(Component::Normal(first)), _) if component_eq(first, "cef") => None,
-        _ => Some(crate::utils::assets_dir().join(path)),
+        _ => Some(crate::paths::assets_dir().join(path)),
     }
 }
 
 fn file_path_to_asset_url(
     path: &Path, query: Option<&str>, fragment: Option<&str>,
 ) -> Option<String> {
-    let root = fs::canonicalize(crate::utils::assets_dir()).ok()?;
+    let root = fs::canonicalize(crate::paths::assets_dir()).ok()?;
     let normalized = normalize_path(path)?;
     let secured = canonicalize_with_missing_tail(&normalized)?;
     let relative = secured.strip_prefix(&root).ok()?;
@@ -515,10 +515,10 @@ fn resolve_asset_request_path(url: &Url) -> Option<PathBuf> {
         relative.push("index.html");
     }
 
-    let candidate = crate::utils::assets_dir().join(relative);
+    let candidate = crate::paths::assets_dir().join(relative);
     let normalized = normalize_path(&candidate)?;
     canonicalize_with_missing_tail(&normalized).and_then(|secured| {
-        let root = fs::canonicalize(crate::utils::assets_dir()).ok()?;
+        let root = fs::canonicalize(crate::paths::assets_dir()).ok()?;
         secured.strip_prefix(&root).ok()?;
         Some(secured)
     })

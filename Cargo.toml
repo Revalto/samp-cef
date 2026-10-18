@@ -11,6 +11,8 @@ members = [
     "cef-api",
     "cef-interface",
     "network",
+    "ipc",
+    "host",
 ]
 
 

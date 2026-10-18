@@ -1,4 +1,4 @@
-use cef_sys::cef_rect_t;
+use ipc::surface::Rect;
 use client_api::gta::matrix::CRect;
 use client_api::gta::rw;
 use client_api::gta::rw::rwcore::{RwRaster, RwTexture};
@@ -65,9 +65,10 @@ impl RwContainer {
         unsafe {
             self.raster.as_mut().map(|raster| {
                 let bytes = raster.as_mut().lock(0);
+                // Строка растра может быть длиннее width * 4 (выравнивание) — берём pitch
                 let size = {
                     let raster = raster.as_mut();
-                    raster.height * raster.width * 4
+                    raster.height * raster.stride
                 };
 
                 RwLockGuard {
@@ -142,38 +143,11 @@ impl SpriteContainer {
     }
 }
 
-enum ViewContainer {
-    Material(RwContainer),
-    Display(SpriteContainer),
-}
-
-impl ViewContainer {
-    fn draw(&mut self) {
-        if let ViewContainer::Display(sprite) = self {
-            sprite.draw();
-        }
-    }
-
-    fn bytes(&mut self) -> Option<RwLockGuard<'_>> {
-        match self {
-            ViewContainer::Display(sprite) => sprite.bytes(),
-            ViewContainer::Material(sprite) => sprite.bytes(),
-        }
-    }
-
-    fn texture(&self) -> Option<NonNull<RwTexture>> {
-        match self {
-            ViewContainer::Display(sprite) => sprite.rw.texture,
-            ViewContainer::Material(rw) => rw.texture,
-        }
-    }
-}
-
+/// Текстура браузера в игре: спрайт на весь экран, пиксели — из общей памяти хоста.
 pub struct View {
-    container: Option<ViewContainer>,
+    container: Option<SpriteContainer>,
     width: usize,
     height: usize,
-    active: bool,
 }
 
 impl View {
@@ -182,7 +156,6 @@ impl View {
             container: None,
             width: 0,
             height: 0,
-            active: true,
         }
     }
 
@@ -190,162 +163,67 @@ impl View {
         let width = std::cmp::max(1, width);
         let height = std::cmp::max(1, height);
 
-        self.destroy_previous();
-
-        self.container = Some(ViewContainer::Display(SpriteContainer::new(width, height)));
-
-        self.set_size(width, height);
-    }
-
-    #[inline(never)]
-    pub fn make_inactive(&mut self) {
-        self.destroy_previous();
-        self.set_size(1, 1);
-        self.active = false;
-    }
-
-    pub fn make_active(&mut self) {
-        self.active = true;
-    }
-
-    #[inline]
-    pub fn draw(&mut self) {
-        if let Some(rw) = self.container.as_mut() {
-            rw.draw()
-        }
-    }
-
-    #[inline(always)]
-    pub fn update_texture(&mut self, bytes: &[u8], rects: &[cef_rect_t]) {
-        if let Some(mut dest) = self.container.as_mut().and_then(|rw| rw.bytes()) {
-            let pitch = dest.pitch;
-            let dest = &mut *dest;
-
-            let dest = dest.as_mut_ptr();
-            let pixels_origin = bytes.as_ptr();
-
-            for cef_rect in rects {
-                for y in cef_rect.y as usize..(cef_rect.y as usize + cef_rect.height as usize) {
-                    unsafe {
-                        let index = pitch * y + cef_rect.x as usize * 4;
-                        let ptr = dest.add(index);
-                        let pixels = pixels_origin.add(index);
-                        std::ptr::copy(pixels, ptr, cef_rect.width as usize * 4);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn update_popup(&mut self, bytes: &[u8], popup_rect: &cef_rect_t) {
-        let set_pixels = |dest: &mut [u8], pitch: usize| {
-            let dest = dest.as_mut_ptr();
-            let popup_pitch = popup_rect.width * 4;
-
-            for y in 0..popup_rect.height {
-                let source_index = y * popup_pitch;
-                let dest_index = (y + popup_rect.y) * pitch as i32 + popup_rect.x * 4;
-
-                unsafe {
-                    let surface_data = dest.add(dest_index as usize);
-                    let new_data = bytes.as_ptr().add(source_index as usize);
-
-                    std::ptr::copy(new_data, surface_data, popup_pitch as usize);
-                }
-            }
-        };
-
-        self.set_texture_bytes(set_pixels);
-    }
-
-    pub fn clear(&mut self) {
-        let clear = |dest: &mut [u8], _: usize| {
-            let size = dest.len();
-            let dest = dest.as_mut_ptr();
-
-            unsafe {
-                std::ptr::write_bytes(dest, 0x00, size);
-            }
-        };
-
-        self.set_texture_bytes(clear);
-    }
-
-    pub fn on_lost_device(&mut self) {
-        self.destroy_previous();
-    }
-
-    pub fn resize(&mut self, is_object: bool, width: usize, height: usize) {
-        if !self.active {
-            return;
-        }
-
-        let should_replace = self.active && self.container.is_none();
-
-        if self.width == width && self.height == height && !should_replace {
-            return;
-        }
-
-        let width = std::cmp::max(1, width);
-        let height = std::cmp::max(1, height);
-
-        self.destroy_previous();
-        self.set_size(width, height);
-
-        if is_object {
-            self.container = Some(ViewContainer::Material(RwContainer::new(width, height)));
-        } else {
-            self.container = Some(ViewContainer::Display(SpriteContainer::new(width, height)));
-        }
-    }
-
-    pub fn rect(&self) -> cef_rect_t {
-        let width = if self.width == 0 {
-            1
-        } else {
-            self.width as i32
-        };
-
-        let height = if self.height == 0 {
-            1
-        } else {
-            self.height as i32
-        };
-
-        cef_rect_t {
-            width,
-            height,
-            x: 0,
-            y: 0,
-        }
-    }
-
-    pub fn rwtexture(&mut self) -> Option<NonNull<RwTexture>> {
-        self.container.as_mut().and_then(|rw| rw.texture())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        // self.render_mode == RenderMode::Empty
-        false
-    }
-
-    fn destroy_previous(&mut self) {
-        self.container.take();
-    }
-
-    fn set_size(&mut self, width: usize, height: usize) {
+        self.container = None;
+        self.container = Some(SpriteContainer::new(width, height));
         self.width = width;
         self.height = height;
     }
 
-    #[inline(always)]
-    fn set_texture_bytes<F>(&mut self, mut func: F)
-    where
-        F: FnMut(&mut [u8], usize),
-    {
-        if let Some(mut bytes) = self.container.as_mut().and_then(|rw| rw.bytes()) {
-            let pitch = bytes.pitch;
-            func(&mut bytes, pitch);
+    /// Текстуры больше нет (RenderWare выключается) — до следующего make_display.
+    pub fn make_inactive(&mut self) {
+        self.container = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.container.is_some()
+    }
+
+    pub fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    #[inline]
+    pub fn draw(&mut self) {
+        if let Some(sprite) = self.container.as_mut() {
+            sprite.draw();
+        }
+    }
+
+    /// Изменившаяся область кадра из общей памяти (строка источника — `width * 4`).
+    pub fn update_from(&mut self, source: &[u8], rect: Rect) {
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let left = rect.x.clamp(0, width);
+        let top = rect.y.clamp(0, height);
+        let right = (rect.x + rect.width).clamp(0, width);
+        let bottom = (rect.y + rect.height).clamp(0, height);
+        if left >= right || top >= bottom || source.len() < self.width * self.height * 4 {
+            return;
+        }
+
+        let Some(mut dest) = self.container.as_mut().and_then(|sprite| sprite.bytes()) else {
+            return;
+        };
+        let pitch = dest.pitch;
+        let source_stride = self.width * 4;
+        let bytes = (right - left) as usize * 4;
+        let dest = dest.bytes_as_mut_ptr();
+
+        for y in top as usize..bottom as usize {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr().add(y * source_stride + left as usize * 4),
+                    dest.add(y * pitch + left as usize * 4),
+                    bytes,
+                );
+            }
+        }
+    }
+
+    /// Пустой кадр — чтобы после показа не мелькнуло старое.
+    pub fn clear(&mut self) {
+        if let Some(mut dest) = self.container.as_mut().and_then(|sprite| sprite.bytes()) {
+            dest.fill(0);
         }
     }
 }

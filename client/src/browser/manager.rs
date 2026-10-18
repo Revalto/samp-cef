@@ -1,417 +1,470 @@
-use crate::app::{Event, ExternalBrowser};
-use crate::audio::{Audio, BrowserAudioSettings};
-use crate::browser::client::WebClient;
-use crate::external::{BrowserReadyCallback, CallbackList};
-
-use cef::handlers::render::PaintElement;
-use cef::types::list::List;
-use cef::types::string::CefString;
-use cef_sys::{cef_event_flags_t, cef_key_event_t, cef_mouse_button_type_t, cef_mouse_event_t};
+//! Браузеры со стороны игры. Сами браузеры живут в cef_host.exe (browser/host.rs), здесь —
+//! их состояние (скрыт, фокус, загружен), текстуры в игре и пересылка ввода.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-
-use client_api::gta::rw::rwcore::RwTexture;
-use client_api::gta::rw::rwplcore::RwSurfaceProperties;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 
-#[derive(Debug, Clone, Copy, Hash, Ord, PartialOrd, Eq, PartialEq)]
-pub enum MouseKey {
-    Left,
-    Middle,
-    Right,
-}
+use ipc::surface::{self, Surface};
+use ipc::{KeyEvent, ToHost, Value};
 
-#[derive(Debug, Clone, Default)]
-struct Mouse {
-    x: i32,
-    y: i32,
-    keys: HashMap<MouseKey, bool>,
-}
+pub use ipc::MouseButton as MouseKey;
 
-#[derive(Clone)]
-pub struct ExternalClient {
-    pub browser: Arc<WebClient>,
-    pub object_ids: Vec<i32>,
-    pub texture: String,
-    pub scale: i32,
-    pub origin_texture: *mut RwTexture,
-    pub origin_surface_props: RwSurfaceProperties,
-    pub audio_settings: BrowserAudioSettings,
-    pub prev_replacement: *mut RwTexture,
+use crate::app::{Event, ExternalBrowser};
+use crate::browser::host::{self, HostProcess};
+use crate::browser::view::View;
+use crate::external::BrowserReadyCallback;
+
+/// Хост упал — через сколько запускать заново.
+const RESPAWN_DELAY: Duration = Duration::from_secs(3);
+
+struct Remote {
+    url: String,
+    hidden: bool,
+    prev_hidden: bool,
+    listen_keys: bool,
+    loaded: bool,
+    view: View,
+    surface: Option<Surface>,
+    surface_name: String,
 }
 
 pub struct Manager {
-    clients: HashMap<u32, Arc<WebClient>>,
-    audio: Arc<Audio>,
+    host: Option<HostProcess>,
+    host_ready: bool,
+    cef_running: bool,
+    respawn_at: Option<Instant>,
+    browsers: HashMap<u32, Remote>,
     ready_callbacks: HashMap<u32, Vec<BrowserReadyCallback>>,
-    clients_on_txd: Vec<ExternalClient>,
     focused: Option<u32>,
     focused_queue: VecDeque<u32>,
     input_corrupted: bool,
     do_not_draw: bool,
     event_tx: Sender<Event>,
-    mouse: Mouse,
-    view_width: usize,
-    view_height: usize,
+    mouse: (i32, i32),
     prev_fps: u64,
-    cef_running: bool,
+    surface_serial: u32,
+    /// Забор кадров из общей памяти в текстуру: сколько раз и сколько стоит (lock/копия/unlock)
+    uploads: ipc::stats::Stats,
+    frames: ipc::stats::Stats,
+    /// Вывод спрайтов: здесь D3D9 загружает изменённую текстуру на видеокарту
+    draws: ipc::stats::Stats,
 }
 
 impl Manager {
-    pub fn new(event_tx: Sender<Event>, audio: Arc<Audio>) -> Manager {
-        // init cef
-        // crate::browser::cef::initialize(event_tx.clone());
-
-        let mut keys = HashMap::new();
-
-        keys.insert(MouseKey::Left, false);
-        keys.insert(MouseKey::Middle, false);
-        keys.insert(MouseKey::Right, false);
-
-        let mouse = Mouse { x: 0, y: 0, keys };
-
+    pub fn new(event_tx: Sender<Event>) -> Manager {
         Manager {
-            clients: HashMap::new(),
-            ready_callbacks: HashMap::new(),
-            clients_on_txd: Vec::new(),
-            view_height: 0,
-            view_width: 0,
-            prev_fps: 60,
-            input_corrupted: false,
-            do_not_draw: false,
+            host: None,
+            host_ready: false,
             cef_running: false,
+            respawn_at: None,
+            browsers: HashMap::new(),
+            ready_callbacks: HashMap::new(),
             focused: None,
             focused_queue: VecDeque::new(),
-            audio,
-            mouse,
+            input_corrupted: false,
+            do_not_draw: false,
             event_tx,
+            mouse: (0, 0),
+            prev_fps: 0,
+            surface_serial: 0,
+            uploads: ipc::stats::Stats::default(),
+            frames: ipc::stats::Stats::default(),
+            draws: ipc::stats::Stats::default(),
         }
     }
 
-    pub fn create_browser(&mut self, id: u32, cbs: CallbackList, url: &str) {
-        let render_mode = crate::utils::current_render_mode();
-        log::trace!(
-            "manager::create_browser({}, {:?}) render_mode: {:?}",
+    fn send(&self, message: ToHost) {
+        if !self.host_ready {
+            return; // всё нужное отправится заново, когда хост будет готов (on_host_ready)
+        }
+        if let Some(host) = self.host.as_ref() {
+            host.send(&message);
+        }
+    }
+
+    // ---- Хост ----------------------------------------------------------------------------
+
+    pub fn initialize_cef(&mut self) {
+        log::trace!("manager::initialize_cef() cef_running: {}", self.cef_running);
+        if self.cef_running {
+            return;
+        }
+        self.cef_running = true;
+        self.spawn_host();
+    }
+
+    fn spawn_host(&mut self) {
+        self.host = host::spawn(self.event_tx.clone());
+        self.host_ready = false;
+        if self.host.is_none() {
+            self.respawn_at = Some(Instant::now() + RESPAWN_DELAY);
+        }
+    }
+
+    pub fn shutdown_cef(&mut self) {
+        // Канал закрывается — хост выходит сам
+        self.host = None;
+        self.host_ready = false;
+        self.cef_running = false;
+    }
+
+    /// Хост запустил CEF. После перезапуска хоста — заново создаём браузеры, что были.
+    pub fn on_host_ready(&mut self) {
+        self.host_ready = true;
+        self.prev_fps = 0;
+
+        let creates: Vec<ToHost> = self
+            .browsers
+            .iter()
+            .map(|(&id, remote)| ToHost::CreateBrowser {
+                id,
+                url: remote.url.clone(),
+                surface: remote.surface_name.clone(),
+                width: remote.view.size().0 as u32,
+                height: remote.view.size().1 as u32,
+                hidden: remote.hidden,
+            })
+            .collect();
+        for message in creates {
+            self.send(message);
+        }
+    }
+
+    pub fn on_host_lost(&mut self) {
+        log::error!("cef_host.exe завершился — перезапуск через {:?}", RESPAWN_DELAY);
+        self.host = None;
+        self.host_ready = false;
+        for remote in self.browsers.values_mut() {
+            remote.loaded = false;
+        }
+        if self.cef_running {
+            self.respawn_at = Some(Instant::now() + RESPAWN_DELAY);
+        }
+    }
+
+    /// Каждый кадр: перезапуск упавшего хоста.
+    pub fn tick(&mut self) {
+        if let Some(at) = self.respawn_at
+            && Instant::now() >= at
+            && self.cef_running
+        {
+            self.respawn_at = None;
+            self.spawn_host();
+        }
+    }
+
+    // ---- Браузеры ------------------------------------------------------------------------
+
+    fn new_surface(&mut self, id: u32, width: usize, height: usize) -> (Option<Surface>, String) {
+        self.surface_serial += 1;
+        let name = surface::name(std::process::id(), id, self.surface_serial);
+        let surface = Surface::create(&name, width as u32, height as u32);
+        if surface.is_none() {
+            log::error!("не создалась общая память {} ({}x{})", name, width, height);
+        }
+        (surface, name)
+    }
+
+    pub fn create_browser(&mut self, id: u32, url: &str) {
+        let [width, height] = crate::utils::client_rect();
+        let (width, height) = (width.max(1), height.max(1));
+        log::trace!("manager::create_browser({}, {:?}) {}x{}", id, url, width, height);
+
+        if self.browsers.contains_key(&id) {
+            self.close_browser(id, true);
+        }
+
+        let (surface, surface_name) = self.new_surface(id, width, height);
+        let mut view = View::new();
+        view.make_display(width, height);
+
+        self.browsers.insert(
             id,
-            url,
-            render_mode
+            Remote {
+                url: url.to_string(),
+                hidden: false,
+                prev_hidden: false,
+                listen_keys: false,
+                loaded: false,
+                view,
+                surface,
+                surface_name: surface_name.clone(),
+            },
         );
 
-        let client = WebClient::new(id, cbs, self.event_tx.clone());
-
-        log::trace!("crate::browser::cef::create_browser");
-
-        crate::browser::cef::create_browser(client.clone(), url);
-        self.append_client(id, client);
+        self.send(ToHost::CreateBrowser {
+            id,
+            url: url.to_string(),
+            surface: surface_name,
+            width: width as u32,
+            height: height as u32,
+            hidden: false,
+        });
     }
 
-    pub fn create_browser_on_texture(&mut self, ext: &ExternalBrowser, cbs: CallbackList) {
-        log::trace!("manager::create_browser_on_texture({:?})", ext);
-
-        let client = WebClient::new_extern(ext.id, cbs, self.event_tx.clone(), self.audio.clone());
-
-        log::trace!("crate::browser::cef::create_browser");
-
-        crate::browser::cef::create_browser(client.clone(), &ext.url);
-        self.append_client(ext.id, client.clone());
-
-        let ext_client = ExternalClient {
-            browser: client,
-            texture: ext.texture.clone(),
-            object_ids: Vec::new(),
-            scale: ext.scale,
-            origin_texture: std::ptr::null_mut(),
-            origin_surface_props: RwSurfaceProperties {
-                ambient: 0.0,
-                diffuse: 0.0,
-                specular: 0.0,
-            },
-            audio_settings: BrowserAudioSettings {
-                max_distance: crate::audio::MAX_DISTANCE,
-                reference_distance: crate::audio::REFRENCE_DISTANCE,
-            },
-            prev_replacement: std::ptr::null_mut(),
-        };
-
-        self.clients_on_txd.push(ext_client);
+    pub fn create_browser_on_texture(&mut self, ext: &ExternalBrowser) {
+        log::error!(
+            "браузеры на текстурах объектов не поддерживаются (id {}, {})",
+            ext.id,
+            ext.url
+        );
     }
 
-    #[inline]
-    pub fn browser_append_to_object(&mut self, id: u32, object_id: i32) {
-        self.audio.add_source(id, object_id);
+    /// Окно игры поменяло размер (другое разрешение) — новая общая память и текстура.
+    fn check_resize(&mut self) {
+        let [width, height] = crate::utils::client_rect();
+        if width == 0 || height == 0 {
+            return; // свёрнуто — оставляем как было
+        }
 
-        self.clients_on_txd
-            .iter_mut()
-            .filter(|cl| cl.browser.id() == id)
-            .for_each(|cl| {
-                cl.object_ids.push(object_id);
-                cl.browser.add_object(object_id);
+        let ids: Vec<u32> = self
+            .browsers
+            .iter()
+            .filter(|(_, remote)| remote.view.is_active() && remote.view.size() != (width, height))
+            .map(|(&id, _)| id)
+            .collect();
 
-                if cl.object_ids.len() == 1 {
-                    cl.browser.hide(false);
-                }
+        for id in ids {
+            let (surface, surface_name) = self.new_surface(id, width, height);
+            if let Some(remote) = self.browsers.get_mut(&id) {
+                remote.view.make_display(width, height);
+                remote.surface = surface;
+                remote.surface_name = surface_name.clone();
+            }
+            self.send(ToHost::Resize {
+                id,
+                surface: surface_name,
+                width: width as u32,
+                height: height as u32,
             });
-    }
-
-    #[inline]
-    pub fn browser_remove_from_object(&mut self, id: u32, object_id: i32) {
-        self.audio.remove_source(id, object_id);
-
-        self.clients_on_txd
-            .iter_mut()
-            .filter(|cl| cl.browser.id() == id)
-            .for_each(|cl| {
-                let mut idx = 0;
-
-                while idx < cl.object_ids.len() {
-                    if cl.object_ids[idx] == object_id {
-                        cl.object_ids.remove(idx);
-                        cl.browser.remove_object(object_id);
-                    } else {
-                        idx += 1;
-                    }
-                }
-
-                if cl.object_ids.is_empty() {
-                    cl.browser.hide(true);
-                }
-            });
-    }
-
-    #[inline]
-    fn append_client(&mut self, id: u32, client: Arc<WebClient>) {
-        if let Some(client) = self.clients.insert(id, client) {
-            self.internal_close(client, true);
         }
     }
 
-    #[inline]
-    pub fn draw(&self) {
-        for client in self.clients.values() {
-            client.update_view();
+    pub fn draw(&mut self) {
+        self.check_resize();
+
+        for remote in self.browsers.values_mut() {
+            if remote.hidden || !remote.view.is_active() {
+                continue;
+            }
+            let Some(surface) = remote.surface.as_ref() else {
+                continue;
+            };
+            // Хост как раз пишет кадр — заберём в следующем
+            if let Some(guard) = surface.try_lock()
+                && let Some(rect) = guard.take_dirty()
+            {
+                let started = Instant::now();
+                remote.view.update_from(guard.pixels(), rect);
+                self.uploads.add(started.elapsed(), (rect.width.max(0) * rect.height.max(0)) as u64);
+            }
+        }
+
+        self.frames.add(std::time::Duration::ZERO, 0);
+        if let Some(frames) = self.frames.report() {
+            log::info!(
+                "кадры игры {}; в текстуру: {}; вывод: {}; частота браузеров {}",
+                frames,
+                self.uploads.report().unwrap_or_else(|| "нет".into()),
+                self.draws.report().unwrap_or_else(|| "нет".into()),
+                self.prev_fps
+            );
         }
 
         if self.do_not_draw {
             return;
         }
+        let started = Instant::now();
 
-        if let Some(&focus) = self.focused.as_ref() {
-            for client in self.clients.values().filter(|client| client.id() != focus) {
-                client.draw();
-            }
-
-            if let Some(focused) = self.clients.get(&focus) {
-                focused.draw();
-            }
-        } else {
-            for client in self.clients.values() {
-                client.draw();
+        let focused = self.focused;
+        for (id, remote) in self.browsers.iter_mut() {
+            if !remote.hidden && Some(*id) != focused {
+                remote.view.draw();
             }
         }
-    }
-
-    #[inline]
-    pub fn on_lost_device(&mut self) {
-        log::trace!("manager::on_lost_device");
-
-        for browser in self.clients.values() {
-            browser.on_lost_device();
-
-            if browser.is_extern() {
-                self.clients_on_txd
-                    .iter_mut()
-                    .filter(|client| client.browser.id() == browser.id())
-                    .for_each(|client| client.origin_texture = std::ptr::null_mut());
-            }
+        if let Some(remote) = focused.and_then(|id| self.browsers.get_mut(&id))
+            && !remote.hidden
+        {
+            remote.view.draw();
         }
+        self.draws.add(started.elapsed(), 0);
     }
 
-    #[inline]
-    pub fn on_reset_device(&self) {
-        log::trace!("manager::on_reset_device");
-
-        for client in self.clients.values() {
-            client.on_reset_device();
-
-            if let Some(host) = client.browser().map(|browser| browser.host()) {
-                host.invalidate(PaintElement::View)
-            }
+    pub fn close_browser(&mut self, id: u32, _force_close: bool) {
+        if self.browsers.remove(&id).is_some() {
+            self.send(ToHost::DestroyBrowser { id });
         }
+        self.ready_callbacks.remove(&id);
+        self.cleanup_focus_after_close(id);
     }
 
-    #[inline]
-    pub fn resize(&mut self, width: usize, height: usize) {
-        log::trace!(
-            "manager::resize(width: {}, height: {}) current values: {} {}",
-            width,
-            height,
-            self.view_width,
-            self.view_height
-        );
+    pub fn close_all_browsers(&mut self) {
+        let ids: Vec<u32> = self.browsers.keys().copied().collect();
+        for id in ids {
+            self.send(ToHost::DestroyBrowser { id });
+        }
+        self.browsers.clear();
+        self.ready_callbacks.clear();
+        self.focused = None;
+        self.focused_queue.clear();
+    }
 
-        if width == self.view_width && height == self.view_height {
+    fn set_hidden(&mut self, id: u32, hide: bool) {
+        let Some(remote) = self.browsers.get_mut(&id) else {
+            return;
+        };
+        if remote.hidden == hide {
             return;
         }
+        remote.hidden = hide;
+        if hide {
+            remote.view.clear();
+        }
+        self.send(ToHost::Hide { id, hide });
+    }
 
-        self.view_width = width;
-        self.view_height = height;
-
-        for browser in self.clients.values() {
-            if !browser.is_extern() {
-                browser.resize(width, height);
+    pub fn hide_browser(&mut self, id: u32, hide: bool) {
+        if self.do_not_draw {
+            // Окно неактивно: запомнить, что показать потом
+            if let Some(remote) = self.browsers.get_mut(&id) {
+                remote.prev_hidden = hide;
             }
+            return;
+        }
+        self.set_hidden(id, hide);
+    }
+
+    pub fn browser_focus(&mut self, id: u32, focus: bool) {
+        if !self.browsers.contains_key(&id) {
+            return;
+        }
+        if focus {
+            if let Some(&cur_id) = self.focused.as_ref() {
+                if cur_id != id {
+                    self.focused_queue.push_back(id);
+                }
+            } else {
+                self.focused = Some(id);
+            }
+        } else if self.focused == Some(id) {
+            self.focused = self.focused_queue.pop_front();
+        } else if let Some(idx) = self.focused_queue.iter().position(|&queued| queued == id) {
+            self.focused_queue.remove(idx);
         }
     }
 
-    #[inline]
+    pub fn trigger_event(&self, name: &str, args: Vec<Value>) {
+        self.send(ToHost::TriggerEvent {
+            name: name.to_string(),
+            args,
+        });
+    }
+
+    pub fn on_browser_created(&mut self, id: u32) {
+        if let Some(remote) = self.browsers.get_mut(&id) {
+            remote.loaded = true;
+        }
+        if let Some(callbacks) = self.ready_callbacks.remove(&id) {
+            callbacks.iter().for_each(|cb| cb(id));
+        }
+    }
+
+    pub fn add_browser_ready(&mut self, browser_id: u32, callback: BrowserReadyCallback) {
+        if self.browser_ready(browser_id) {
+            callback(browser_id);
+            return;
+        }
+        self.ready_callbacks.entry(browser_id).or_default().push(callback);
+    }
+
+    pub fn toggle_dev_tools(&self, browser_id: u32, enabled: bool) {
+        self.send(ToHost::DevTools {
+            id: browser_id,
+            enabled,
+        });
+    }
+
+    pub fn always_listen_keys(&mut self, browser_id: u32, listen: bool) {
+        if let Some(remote) = self.browsers.get_mut(&browser_id) {
+            remote.listen_keys = listen;
+        }
+    }
+
+    pub fn load_url(&mut self, browser_id: u32, url: &str) {
+        if let Some(remote) = self.browsers.get_mut(&browser_id) {
+            remote.url = url.to_string();
+            remote.loaded = false;
+        }
+        self.send(ToHost::LoadUrl {
+            id: browser_id,
+            url: url.to_string(),
+        });
+    }
+
+    pub fn update_fps(&mut self, fps: u64) {
+        if self.prev_fps != fps {
+            self.prev_fps = fps;
+            self.send(ToHost::FrameRate(std::cmp::max(15, fps as i32)));
+        }
+    }
+
+    /// RenderWare выключается — текстур больше нет.
+    pub fn remove_views(&mut self) {
+        for remote in self.browsers.values_mut() {
+            remote.view.make_inactive();
+        }
+    }
+
+    // ---- Ввод ----------------------------------------------------------------------------
+
     pub fn send_mouse_move_event(&mut self, x: i32, y: i32) {
+        self.mouse = (x, y);
         if self.input_corrupted {
             return;
         }
-
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
-            self.mouse.x = x;
-            self.mouse.y = y;
-
-            let keys = &self.mouse.keys;
-
-            let mut event = cef_mouse_event_t { x, y, modifiers: 0 };
-
-            if keys.get(&MouseKey::Left).cloned().unwrap_or(false) {
-                event.modifiers |= cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON as u32;
-            }
-
-            if keys.get(&MouseKey::Middle).cloned().unwrap_or(false) {
-                event.modifiers |= cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON as u32;
-            }
-
-            if keys.get(&MouseKey::Right).cloned().unwrap_or(false) {
-                event.modifiers |= cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON as u32;
-            }
-
-            host.send_mouse_move(event);
+        if let Some(id) = self.focused {
+            self.send(ToHost::MouseMove { id, x, y });
         }
     }
 
-    #[inline]
     pub fn send_mouse_click_event(&mut self, button: MouseKey, is_down: bool) {
         if self.input_corrupted {
             return;
         }
-
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
-            self.mouse.keys.insert(button, is_down);
-
-            let event = cef_mouse_event_t {
-                x: self.mouse.x,
-                y: self.mouse.y,
-                modifiers: 0,
-            };
-
-            let key = match button {
-                MouseKey::Left => cef_mouse_button_type_t::MBT_LEFT,
-                MouseKey::Middle => cef_mouse_button_type_t::MBT_MIDDLE,
-                MouseKey::Right => cef_mouse_button_type_t::MBT_RIGHT,
-            };
-
-            host.send_mouse_click(key, event, is_down);
+        if let Some(id) = self.focused {
+            let (x, y) = self.mouse;
+            self.send(ToHost::MouseClick {
+                id,
+                x,
+                y,
+                button,
+                down: is_down,
+            });
         }
     }
 
-    #[inline]
     pub fn send_mouse_wheel(&self, delta: i32) {
         if self.input_corrupted {
             return;
         }
-
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
-            host.send_mouse_wheel(self.mouse.x, self.mouse.y, delta);
+        if let Some(id) = self.focused {
+            let (x, y) = self.mouse;
+            self.send(ToHost::MouseWheel { id, x, y, delta });
         }
     }
 
-    #[inline]
-    pub fn send_keyboard_event(&self, event: cef_key_event_t) {
+    pub fn send_keyboard_event(&self, event: KeyEvent) {
         if self.input_corrupted {
             return;
         }
-
-        // отправлять события клавиш ТОЛЬКО сфокусированному браузеру. иначе можно и другим запросившим
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
-            host.send_keyboard_event(event);
+        // Клавиши — только браузеру в фокусе; без фокуса — тем, кто попросил слушать всегда
+        if let Some(id) = self.focused {
+            self.send(ToHost::Key { id, event });
         } else {
-            for host in self
-                .clients
-                .values()
-                .filter(|client| client.always_listen_keys())
-                .filter_map(|client| client.browser().map(|browser| browser.host()))
-            {
-                host.send_keyboard_event(event);
-            }
-        }
-    }
-
-    pub fn trigger_event(&self, event_name: &str, list: List) {
-        for client in self.clients.values() {
-            if let Some(frame) = client.browser().map(|browser| browser.main_frame()) {
-                let name = CefString::new(event_name);
-                let msg = cef::process_message::ProcessMessage::create("trigger_event");
-
-                let args = msg.argument_list();
-                args.set_string(0, &name);
-                args.set_list(1, list.clone());
-
-                frame.send_process_message(cef::ProcessId::Renderer, msg);
-            }
-        }
-    }
-
-    pub fn close_browser(&mut self, id: u32, force_close: bool) {
-        if let Some(client) = self.clients.remove(&id) {
-            self.internal_close(client, force_close);
-        }
-
-        self.cleanup_focus_after_close(id);
-    }
-
-    #[inline]
-    pub fn hide_browser(&self, id: u32, hide: bool) {
-        if let Some(browser) = self.clients.get(&id) {
-            browser.hide(hide);
-        }
-    }
-
-    pub fn browser_focus(&mut self, id: u32, focus: bool) {
-        if self.clients.contains_key(&id) {
-            if focus {
-                if let Some(&cur_id) = self.focused.as_ref() {
-                    if cur_id != id {
-                        self.focused_queue.push_back(id);
-                    }
-                } else {
-                    self.focused = Some(id);
-                }
-            } else if self
-                .focused
-                .as_ref()
-                .filter(|focused| **focused == id)
-                .is_some()
-            {
-                self.focused = self.focused_queue.pop_front();
-            } else {
-                self.focused_queue
-                    .iter()
-                    .position(|&queue| queue == id)
-                    .map(|idx| self.focused_queue.remove(idx));
+            for (&id, _) in self.browsers.iter().filter(|(_, remote)| remote.listen_keys) {
+                self.send(ToHost::Key { id, event });
             }
         }
     }
@@ -426,9 +479,8 @@ impl Manager {
         if self.input_corrupted {
             return false;
         }
-
         if self.is_input_blocked() {
-            self.focused.as_ref().filter(|&&id| id == browser).is_some()
+            self.focused == Some(browser)
         } else {
             true
         }
@@ -444,203 +496,55 @@ impl Manager {
         self.input_corrupted
     }
 
-    #[inline(always)]
+    /// Окно игры неактивно / открыто меню GTA — браузеры прячем, потом возвращаем как было.
     pub fn do_not_draw(&mut self, donot: bool) {
-        if self.do_not_draw != donot {
-            self.do_not_draw = donot;
-            self.temporary_hide(donot);
+        if self.do_not_draw == donot {
+            return;
         }
+
+        let ids: Vec<u32> = self.browsers.keys().copied().collect();
+        for id in ids {
+            if donot {
+                if let Some(remote) = self.browsers.get_mut(&id) {
+                    remote.prev_hidden = remote.hidden;
+                }
+                self.set_hidden(id, true);
+            } else {
+                let prev = self.browsers.get(&id).map(|r| r.prev_hidden).unwrap_or(true);
+                self.set_hidden(id, prev);
+            }
+        }
+
+        self.do_not_draw = donot;
     }
 
     #[inline(always)]
     pub fn browser_exists(&self, browser_id: u32) -> bool {
-        self.clients.contains_key(&browser_id)
+        self.browsers.contains_key(&browser_id)
     }
 
     #[inline(always)]
     pub fn browser_ready(&self, browser_id: u32) -> bool {
-        self.clients
-            .get(&browser_id)
-            .and_then(|client| client.browser())
-            .map(|browser| !browser.is_loading())
-            .unwrap_or(false)
-    }
-
-    pub fn toggle_dev_tools(&self, browser_id: u32, enabled: bool) {
-        if let Some(client) = self.clients.get(&browser_id) {
-            client.toggle_dev_tools(enabled)
-        }
-    }
-
-    pub fn always_listen_keys(&self, browser_id: u32, listen: bool) {
-        if let Some(client) = self.clients.get(&browser_id) {
-            client.set_always_listen_keys(listen)
-        }
-    }
-
-    pub fn set_audio_settings(&mut self, browser_id: u32, audio_settings: BrowserAudioSettings) {
-        self.clients_on_txd
-            .iter_mut()
-            .filter(|cl| cl.browser.id() == browser_id)
-            .for_each(|cl| {
-                cl.audio_settings = audio_settings;
-            });
-    }
-
-    pub fn load_url(&self, browser_id: u32, url: &str) {
-        if let Some(client) = self.clients.get(&browser_id) {
-            client.load_url(url)
-        }
-    }
-
-    pub fn call_browser_ready(&self, browser_id: u32) {
-        if let Some(callbacks) = self.ready_callbacks.get(&browser_id) {
-            callbacks.iter().for_each(|cb| cb(browser_id))
-        }
-    }
-
-    pub fn add_browser_ready(&mut self, browser_id: u32, callback: BrowserReadyCallback) {
-        if self.browser_ready(browser_id) {
-            callback(browser_id);
-            return;
-        }
-
-        self.ready_callbacks
-            .entry(browser_id)
-            .or_default()
-            .push(callback);
-    }
-
-    #[inline(always)]
-    pub fn external_browsers(&mut self) -> &mut [ExternalClient] {
-        &mut self.clients_on_txd
-    }
-
-    #[inline(always)]
-    pub fn update_fps(&mut self, fps: u64) {
-        let fps_small = fps as i32;
-        let fps_small = std::cmp::max(15, fps_small); // std::cmp::min(60, fps_small)
-
-        for browser in self.clients.values().filter_map(|client| client.browser()) {
-            let host = browser.host();
-
-            if self.prev_fps != fps {
-                host.set_windowless_frame_rate(fps_small);
-                self.prev_fps = fps;
-            }
-        }
-    }
-
-    pub fn close_all_browsers(&mut self) {
-        self.clients_on_txd.clear();
-        let audio = self.audio.clone();
-
-        self.clients
-            .drain()
-            .for_each(|(_, client)| Self::internal_close_client(client, &audio, true));
-
-        self.focused = None;
-        self.focused_queue.clear();
-    }
-
-    pub fn initialize_cef(&mut self) {
-        log::trace!("manager::intialize_cef() cef_running: {}", self.cef_running);
-
-        if self.cef_running {
-            return;
-        }
-
-        log::trace!("PRE cef::initalize()");
-        crate::browser::cef::initialize(self.event_tx.clone());
-        log::trace!("POST cef::initalize()");
-
-        self.cef_running = true;
-    }
-
-    pub fn shutdown_cef(&mut self) {
-        log::trace!("manager::shutdown_cef() cef_running: {}", self.cef_running);
-
-        if !self.cef_running {
-            return;
-        }
-
-        log::trace!("PRE cef::shutdown()");
-        cef::shutdown();
-        log::trace!("POST cef::shutdown()");
-    }
-
-    pub fn remove_views(&mut self) {
-        log::trace!("remove views");
-
-        for client in self.clients.values() {
-            client.remove_view();
-        }
-
-        log::trace!("remove views done");
-    }
-
-    #[inline]
-    fn temporary_hide(&self, hide: bool) {
-        for client in self.clients.values() {
-            if hide {
-                client.internal_hide(true, true);
-            } else {
-                client.restore_hide_status();
-            }
-        }
-    }
-
-    fn internal_close(&mut self, client: Arc<WebClient>, force_close: bool) {
-        if client.is_extern()
-            && let Some(idx) = self
-                .clients_on_txd
-                .iter()
-                .position(|cl| cl.browser.id() == client.id())
-        {
-            self.clients_on_txd.remove(idx);
-        }
-
-        Self::internal_close_client(client, &self.audio, force_close);
-    }
-
-    fn internal_close_client(client: Arc<WebClient>, audio: &Arc<Audio>, force_close: bool) {
-        log::trace!("internal_close_client");
-
-        client.close(force_close);
-
-        log::trace!("remove_view");
-
-        client.remove_view();
-
-        log::trace!("remove_all_streams");
-
-        audio.remove_all_streams(client.id());
-
-        log::trace!("internal_close_client end");
+        self.browsers.get(&browser_id).map(|r| r.loaded).unwrap_or(false)
     }
 
     fn cleanup_focus_after_close(&mut self, closed_id: u32) {
+        let browsers = &self.browsers;
         self.focused_queue
-            .retain(|&id| id != closed_id && self.clients.contains_key(&id));
+            .retain(|&id| id != closed_id && browsers.contains_key(&id));
 
-        let focused_stale = self
-            .focused
-            .as_ref()
-            .filter(|id| !self.clients.contains_key(id))
-            .is_some();
-
+        let focused_stale = self.focused.is_some_and(|id| !self.browsers.contains_key(&id));
         if self.focused == Some(closed_id) || focused_stale {
             self.focused = None;
-
             while let Some(next_id) = self.focused_queue.pop_front() {
-                if self.clients.contains_key(&next_id) {
+                if self.browsers.contains_key(&next_id) {
                     self.focused = Some(next_id);
                     break;
                 }
             }
         }
 
-        if self.clients.is_empty() {
+        if self.browsers.is_empty() {
             self.focused = None;
             self.focused_queue.clear();
         }

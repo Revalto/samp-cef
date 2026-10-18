@@ -90,7 +90,7 @@ export LIB="${DX_SDK_LIB}${LIB:+;$LIB}"
 
 echo "Building Windows client artifacts for $TARGET"
 cargo xwin build --release --target "$TARGET" \
-  -p client -p renderer -p loader \
+  -p client -p renderer -p loader -p host \
   --xwin-arch x86,x86_64 \
   --cross-compiler clang-cl \
   --xwin-cache-dir .xwin/

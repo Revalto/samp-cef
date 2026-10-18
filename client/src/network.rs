@@ -245,26 +245,26 @@ impl Network {
     }
 
     fn handle_emit_event(&mut self, packet: packets::EmitEvent) {
-        let list = cef::types::list::List::new();
-
-        for (idx, arg) in packet.arguments.iter().enumerate() {
-            if let Some(f) = arg.float_value {
-                list.set_double(idx, f as f64);
-            }
-
-            if let Some(i) = arg.integer_value {
-                list.set_integer(idx, i);
-            }
-
-            if let Some(s) = &arg.string_value {
-                let cef_str = cef::types::string::CefString::new(s);
-                list.set_string(idx, &cef_str);
-            }
-        }
+        // Как раньше: у аргумента заполнено одно из полей, если несколько — побеждает строка
+        let args = packet
+            .arguments
+            .iter()
+            .map(|arg| {
+                if let Some(s) = &arg.string_value {
+                    ipc::Value::String(s.to_string())
+                } else if let Some(i) = arg.integer_value {
+                    ipc::Value::Int(i)
+                } else if let Some(f) = arg.float_value {
+                    ipc::Value::Double(f as f64)
+                } else {
+                    ipc::Value::Null
+                }
+            })
+            .collect();
 
         handle_result(
             self.event_tx
-                .send(Event::EmitEvent(packet.event_name.to_string(), list)),
+                .send(Event::EmitEvent(packet.event_name.to_string(), args)),
         );
     }
 
@@ -310,16 +310,8 @@ impl Network {
         handle_result(self.event_tx.send(event));
     }
 
-    fn handle_set_audio_settings(&mut self, packet: packets::SetAudioSettings) {
-        let event = Event::SetAudioSettings(
-            packet.browser_id,
-            crate::audio::BrowserAudioSettings {
-                max_distance: packet.max_distance,
-                reference_distance: packet.reference_distance,
-            },
-        );
-
-        handle_result(self.event_tx.send(event));
+    fn handle_set_audio_settings(&mut self, _packet: packets::SetAudioSettings) {
+        handle_result(self.event_tx.send(Event::SetAudioSettings));
     }
 
     fn handle_load_url(&mut self, packet: packets::LoadUrl) {
