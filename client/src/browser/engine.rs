@@ -75,12 +75,12 @@ fn ini_engine() -> Option<String> {
 }
 
 pub fn choose() -> Engine {
-    let wanted = std::env::var("DELIRIUM_CEF_ENGINE")
+    let from_env = std::env::var("DELIRIUM_CEF_ENGINE")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty() && v != "auto")
-        .or_else(ini_engine)
-        .unwrap_or_default();
+        .filter(|v| !v.is_empty() && v != "auto");
+    let source = if from_env.is_some() { "DELIRIUM_CEF_ENGINE" } else { "cef_host.ini" };
+    let wanted = from_env.or_else(ini_engine).unwrap_or_default();
     let available = stamp().is_some();
     let engine = match wanted.as_str() {
         "legacy" => Engine::Legacy,
@@ -89,9 +89,10 @@ pub fn choose() -> Engine {
         _ => Engine::Legacy,
     };
     log::info!(
-        "интерфейс: {} (выбор лаунчера: {}, современный {}{})",
+        "интерфейс: {} (выбор: {} из {}, современный {}{})",
         engine.name(),
         if wanted.is_empty() { "auto" } else { wanted.as_str() },
+        source,
         if available { "есть" } else { "не установлен" },
         if available && modern_disabled() { ", отключён после сбоя — cef-modern\\disabled.txt" } else { "" }
     );

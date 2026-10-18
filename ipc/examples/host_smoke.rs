@@ -137,13 +137,14 @@ fn main() {
     drop(guard);
     let _ = std::fs::write("host_smoke.bmp", bmp);
 
-    // Частота кадров интерфейса: вторая страница во весь «экран» 1920×1080 с анимацией на каждом
+    // Частота кадров интерфейса (в data:-адресе нельзя «%»: %36 раскодируется в «6» и ломает
+    // скрипт — поэтому остаток от деления через Math.floor): вторая страница во весь «экран» 1920×1080 с анимацией на каждом
     // кадре (как перетаскивание карты — меняется весь кадр). Забираем кадры, как игра, 4 с.
     const AW: u32 = 1920;
     const AH: u32 = 1080;
     const ANIM: &str = "data:text/html,<html><body style='margin:0;overflow:hidden'>\
 <div id='a' style='position:absolute;inset:0'></div><script>var t=0;function f(){t++;\
-document.getElementById('a').style.background='linear-gradient('+(t%360)+'deg,rgb(255,0,0),rgb(0,0,255))';\
+document.getElementById('a').style.background='linear-gradient('+(t-Math.floor(t/360)*360)+'deg,rgb(255,0,0),rgb(0,0,255))';\
 requestAnimationFrame(f);}requestAnimationFrame(f);</script></body></html>";
     writer.send(&ToHost::FrameRate(240));
     let anim_name = ipc::surface::name(std::process::id(), 2, 1);
