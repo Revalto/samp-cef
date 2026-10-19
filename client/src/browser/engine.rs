@@ -6,6 +6,9 @@
 //!   ~40–60 к/с. Запасной путь, если современный не работает на этом компьютере.
 //!
 //! Выбор:
+//! * `DELIRIUM_CEF_ENGINE=off` — интерфейса нет вовсе (лаунчер: «Интерфейс: выключен», для слабых ПК):
+//!   client.dll не запускается (lib.rs), сервер видит игрока без CEF и показывает ему текстдравы и диалоги,
+//!   как игрокам без лаунчера;
 //! * `DELIRIUM_CEF_ENGINE=legacy | modern | auto` — переменная окружения игры, её ставит лаунчер
 //!   (галочка «Совместимый режим интерфейса»); нет — `engine` из `cef\cef_host.ini` (его раздаёт
 //!   лаунчер — так мы можем вернуть всех на совместимый без новой сборки); нет и там — auto;
@@ -72,6 +75,11 @@ fn ini_engine() -> Option<String> {
         .filter_map(|line| line.split_once('='))
         .find(|(key, _)| key.trim().eq_ignore_ascii_case("engine"))
         .map(|(_, value)| value.trim().to_ascii_lowercase())
+}
+
+/// Интерфейс выключен игроком (лаунчер ставит `DELIRIUM_CEF_ENGINE=off`).
+pub fn disabled() -> bool {
+    std::env::var("DELIRIUM_CEF_ENGINE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
 }
 
 pub fn choose() -> Engine {

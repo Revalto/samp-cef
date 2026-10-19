@@ -48,6 +48,13 @@ pub extern "C" fn cef_client_initialize() {
         #[cfg(feature = "crash_logger")]
         crash_logger::initialize();
 
+        // Игрок выключил интерфейс в лаунчере: ни хоста, ни соединения с сервером - для сервера
+        // это игрок без CEF (текстдравы и диалоги)
+        if browser::engine::disabled() {
+            log::info!("интерфейс выключен (DELIRIUM_CEF_ENGINE=off) - CEF не запускается");
+            return;
+        }
+
         app::initialize();
     });
 }
