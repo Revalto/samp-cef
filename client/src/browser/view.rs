@@ -6,6 +6,12 @@ use client_api::gta::rw::rwplcore::{self, RwRGBA};
 use client_api::gta::sprite::Sprite;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use winapi::shared::d3d9::IDirect3DTexture9;
+use winapi::shared::d3d9types::D3DLOCKED_RECT;
+use winapi::shared::windef::RECT;
+
+/// RwD3D9RasterExtOffset (gta_sa.exe 1.0 US): смещение расширения растра D3D9, его первое поле — текстура
+const RW_D3D9_RASTER_EXT_OFFSET: usize = 0xB4E9E0;
 
 pub struct RwLockGuard<'a> {
     bytes: &'a mut [u8],
@@ -58,6 +64,55 @@ impl RwContainer {
             texture: NonNull::new(texture),
             raster: NonNull::new(raster),
         }
+    }
+
+    /// Текстура D3D9 растра — для блокировки только изменившейся области
+    fn d3d_texture(&self) -> Option<NonNull<IDirect3DTexture9>> {
+        let raster = self.raster?;
+        unsafe {
+            let offset = *(RW_D3D9_RASTER_EXT_OFFSET as *const i32);
+            if offset <= 0 {
+                return None;
+            }
+            NonNull::new(*((raster.as_ptr() as *const u8).add(offset as usize) as *const *mut IDirect3DTexture9))
+        }
+    }
+
+    /// Строки области `rect` из `source` (строка источника — `stride`) в текстуру. Блокируется только эта
+    /// область: блокировка RenderWare (`bytes`) берёт весь уровень, и управляемая текстура D3D9 потом целиком
+    /// уходит в видеокарту — на 3440x1440 это ~20 МБ на каждый кадр интерфейса, рывок в кадре игры.
+    /// false — текстуры D3D9 нет или блокировка не удалась: тогда — через `bytes`.
+    fn update_rect(&mut self, source: &[u8], stride: usize, left: i32, top: i32, right: i32, bottom: i32) -> bool {
+        let Some(texture) = self.d3d_texture() else {
+            return false;
+        };
+        let area = RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let mut locked = D3DLOCKED_RECT {
+            Pitch: 0,
+            pBits: std::ptr::null_mut(),
+        };
+        unsafe {
+            let texture = &*texture.as_ptr();
+            if texture.LockRect(0, &mut locked, &area, 0) < 0 || locked.pBits.is_null() {
+                return false;
+            }
+            let bytes = (right - left) as usize * 4;
+            let dest = locked.pBits as *mut u8;
+            for (row, y) in (top as usize..bottom as usize).enumerate() {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr().add(y * stride + left as usize * 4),
+                    dest.add(row * locked.Pitch as usize),
+                    bytes,
+                );
+            }
+            texture.UnlockRect(0);
+        }
+        true
     }
 
     #[inline]
@@ -141,6 +196,11 @@ impl SpriteContainer {
     pub fn bytes(&mut self) -> Option<RwLockGuard<'_>> {
         self.rw.bytes()
     }
+
+    #[inline]
+    fn update_rect(&mut self, source: &[u8], stride: usize, left: i32, top: i32, right: i32, bottom: i32) -> bool {
+        self.rw.update_rect(source, stride, left, top, right, bottom)
+    }
 }
 
 /// Текстура браузера в игре: спрайт на весь экран, пиксели — из общей памяти хоста.
@@ -201,11 +261,17 @@ impl View {
             return;
         }
 
+        let source_stride = self.width * 4;
+        if let Some(sprite) = self.container.as_mut() {
+            if sprite.update_rect(source, source_stride, left, top, right, bottom) {
+                return;
+            }
+        }
+
         let Some(mut dest) = self.container.as_mut().and_then(|sprite| sprite.bytes()) else {
             return;
         };
         let pitch = dest.pitch;
-        let source_stride = self.width * 4;
         let bytes = (right - left) as usize * 4;
         let dest = dest.bytes_as_mut_ptr();
 
